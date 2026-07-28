@@ -67,7 +67,7 @@
 ```bash
 # 1. 克隆仓库
 git clone https://github.com/xyrct301/cerebras-proxy-re.git
-cd cerebras-api-gateway
+cd cerebras-proxy-re
 
 # 2. 安装依赖
 pip install -r requirements.txt
@@ -83,14 +83,23 @@ uvicorn api.index:app --reload --port 8000
 
 ---
 
-### 2. 部署至 Koyeb (推荐 / 免费防休眠)
+### 2. 部署至 Vercel (Serverless)
 
-1. 登录 [Koyeb.com](https://www.koyeb.com) 并关联你的 GitHub 仓库。
-2. 创建服务，构建类型选择 **Buildpack** 或 **Docker**。
-3. 暴露端口设置：`8000`。
-4. 在 **Environment Variables** 中设置 `CEREBRAS_API_KEYS` 等配置。
-5. 点击 **Deploy** 即可完成公网上线。
+仓库内置了 `vercel.json` 配置文件：
 
+```json
+{
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/api/index"
+    }
+  ]
+}
+
+直接点击导入 Vercel 项目，在 Settings -> Environment Variables 注入配置即可一键部署。
+
+---
 ---
 
 ### 3. 部署至 Render (配合保活)
@@ -104,24 +113,15 @@ uvicorn api.index:app --reload --port 8000
 
 ---
 
-### 4. 部署至 Vercel (Serverless)
+### 4. 部署至 Koyeb
 
-仓库内置了 `vercel.json` 配置文件：
+1. 登录 [Koyeb.com](https://www.koyeb.com) 并关联你的 GitHub 仓库。
+2. 创建服务，构建类型选择 **Buildpack** 或 **Docker**。
+3. 暴露端口设置：`8000`。
+4. 在 **Environment Variables** 中设置 `CEREBRAS_API_KEYS` 等配置。
+5. 点击 **Deploy** 即可完成公网上线。
 
-```json
-{
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/api/index"
-    }
-  ]
-}
 ```
-
-直接点击导入 Vercel 项目，在 Settings -> Environment Variables 注入配置即可一键部署。
-
----
 
 ## 💻 客户端接入说明
 
