@@ -66,7 +66,7 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/your-username/cerebras-api-gateway.git
+git clone https://github.com/xyrct301/cerebras-proxy-re.git
 cd cerebras-api-gateway
 
 # 2. 安装依赖
