@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, Form, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from dotenv import load_dotenv
 
@@ -20,7 +21,7 @@ load_dotenv()
 # ======================================================
 # VERSION & CHANGELOG
 # ======================================================
-VERSION = "2.0.1-FastAPI"  # 极速版：优化 AsyncClient 长连接复用、HTTP/2 multiplexing 与传输延迟
+VERSION = "2.0.2-FastAPI-OpenCodeCompatible"  # 兼容 OpenCode / Cursor 编辑器标准规范
 
 # ======================================================
 # CONFIG & MODES
@@ -358,7 +359,7 @@ class AsyncKeyPool:
 
 pool = AsyncKeyPool(CEREBRAS_API_KEYS)
 
-# 使用 FastAPI 现代 Lifespan 结构替换已废弃的 on_event("startup")
+# FastAPI Lifespan 结构
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_global_stats()
@@ -366,6 +367,15 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="Cerebras OpenAI Gateway", version=VERSION, lifespan=lifespan)
+
+# 增加 CORS 全局中间件兼容 OpenCode/Web客户端
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ======================================================
 # HTML HELPER & AUTH
@@ -454,7 +464,6 @@ def sanitize_body(body: dict, show_thinking: bool, target_model: str = None) -> 
     if new["stream"]:
         new["stream_options"] = {"include_usage": True}
     
-    # 按照 Cerebras 标准控制思考字段
     if not show_thinking:
         model_lower = str(model).lower()
         if "glm" in model_lower:
@@ -605,7 +614,6 @@ async def chat(request: Request):
                     response = None
 
                     try:
-                        # 修复：timeout 放在 build_request 内部，send() 不再多传
                         req = async_client.build_request(
                             "POST",
                             f"{CEREBRAS_BASE_URL}/chat/completions",
@@ -630,6 +638,13 @@ async def chat(request: Request):
                                     break
                                 try:
                                     obj = json.loads(data_body)
+
+                                    # 修正：补充兼容 OpenCode 等编辑器解析的标准 SSE 字段
+                                    if "id" not in obj: obj["id"] = f"chatcmpl-{request_id}"
+                                    if "object" not in obj: obj["object"] = "chat.completion.chunk"
+                                    if "created" not in obj: obj["created"] = int(time.time())
+                                    if "model" not in obj: obj["model"] = selected_model
+
                                     if "usage" in obj and obj["usage"]:
                                         last_usage = obj["usage"]
                                     
@@ -1080,13 +1095,14 @@ async def fallbackmode_page(mode: Optional[str] = None):
 </ul>"""
     return HTMLResponse(content=html_page("Fallback Control", body))
 
+# 修正：补全 OpenAI 标准 created / owned_by 字段，解决 OpenCode / Cursor 无法识别模型列表的问题
 @app.get("/v1/models")
 async def models():
     return JSONResponse(content={
         "object": "list",
         "data": [
-            {"id": GLM_MODEL, "object": "model"}, 
-            {"id": GPT_MODEL, "object": "model"}
+            {"id": GLM_MODEL, "object": "model", "created": 1700000000, "owned_by": "cerebras"}, 
+            {"id": GPT_MODEL, "object": "model", "created": 1700000000, "owned_by": "cerebras"}
         ]
     })
 
