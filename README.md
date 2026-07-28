@@ -11,23 +11,16 @@
 
 
 ![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)
-
 ![Framework](https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg)
-
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
-
 ![HTTP2 Enabled](https://img.shields.io/badge/HTTP%2F2-Enabled-brightgreen)
 
 
 
 [功能特性](#-功能特性) •
-
 [部署指南](#-全平台部署指南) •
-
 [控制面板](#-可视化控制面板) •
-
 [环境变量](#-环境变量配置) •
-
 [客户端接入](#-客户端接入说明)
 
 
