@@ -100,7 +100,6 @@ uvicorn api.index:app --reload --port 8000
 直接点击导入 Vercel 项目，在 Settings -> Environment Variables 注入配置即可一键部署。
 
 ---
----
 
 ### 3. 部署至 Render (配合保活)
 
@@ -121,6 +120,7 @@ uvicorn api.index:app --reload --port 8000
 4. 在 **Environment Variables** 中设置 `CEREBRAS_API_KEYS` 等配置。
 5. 点击 **Deploy** 即可完成公网上线。
 
+---
 ```
 
 ## 💻 客户端接入说明
