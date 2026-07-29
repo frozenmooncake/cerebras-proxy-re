@@ -1,5 +1,8 @@
 import os
 import sys
+import hmac
+import hashlib
+import html as html_lib
 import json
 import time
 import uuid
@@ -22,8 +25,22 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from groq_provider import execute_groq_request, sanitize_groq_response, sanitize_sse_stream, GROQ_MODELS, groq_pool
+from agnes_provider import (
+    AGNES_IMAGE_MODEL,
+    AGNES_MODELS,
+    AGNES_TEXT_MODEL,
+    AGNES_VIDEO_MODEL,
+    execute_agnes_chat_request,
+    execute_agnes_request,
+    get_agnes_counts,
+    get_agnes_metrics,
+    query_agnes_video_result,
+    sanitize_agnes_response,
+    sanitize_agnes_sse_stream,
+)
+from access_control import ClientPrincipal, access_manager
 
-VERSION = "2.0.4-FastAPI"
+VERSION = "2.0.5-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 GEMMA_MODEL = "gemma-4-31b"
@@ -45,6 +62,7 @@ DEBUG_MAX_TEXT_LEN = 20000
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 
 CUSTOM_API_KEYS = set(filter(None, os.getenv("CUSTOM_API_KEYS", "").split(",")))
 CEREBRAS_API_KEYS = list(filter(None, os.getenv("CEREBRAS_API_KEYS", "").split(",")))
@@ -75,6 +93,16 @@ async def upstash_get_async(key: str) -> Optional[Any]:
         pass
     return None
 
+async def upstash_get_strict_async(key: str) -> Optional[Any]:
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+    url = f"{UPSTASH_REDIS_REST_URL}/get/{key}"
+    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+    response = await async_client.get(url, headers=headers, timeout=3.0)
+    response.raise_for_status()
+    result = response.json().get("result")
+    return json.loads(result) if result else None
+
 async def upstash_set_async(key: str, value: Any) -> bool:
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
         return False
@@ -93,10 +121,11 @@ def get_default_stats():
         "total_requests": 0,       
         "fallback_count": 0,       
         "groq_fallback_count": 0,
+        "agnes_requests": 0,
         "429_count": 0,            
         "truncated_count": 0,      
         "other_models_count": 0,    
-        "models": {m: {"requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0} for m in CEREBRAS_MODELS + GROQ_MODELS}
+        "models": {m: {"requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0} for m in CEREBRAS_MODELS + GROQ_MODELS + AGNES_MODELS}
     }
 
 GLOBAL_STATS = get_default_stats()
@@ -128,10 +157,34 @@ async def save_global_stats_async():
 
 REQUEST_LOGS = deque(maxlen=100)
 log_lock = asyncio.Lock()
+VIDEO_TASK_OWNERS = {}
+video_task_lock = asyncio.Lock()
 
 async def add_log_async(data: dict):
     async with log_lock:
         REQUEST_LOGS.appendleft(data)
+
+def video_owner_key(task_id: str) -> str:
+    digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+    return f"agnes_video_owner:{digest}"
+
+async def save_video_owner(task_id: str, owner: dict):
+    async with video_task_lock:
+        VIDEO_TASK_OWNERS[task_id] = owner
+    if UPSTASH_REDIS_REST_URL:
+        await upstash_set_async(video_owner_key(task_id), owner)
+
+async def get_video_owner(task_id: str) -> Optional[dict]:
+    async with video_task_lock:
+        owner = VIDEO_TASK_OWNERS.get(task_id)
+    if owner:
+        return owner
+    owner = await upstash_get_async(video_owner_key(task_id))
+    if isinstance(owner, dict):
+        async with video_task_lock:
+            VIDEO_TASK_OWNERS[task_id] = owner
+        return owner
+    return None
 
 DEBUG_LOGS = deque(maxlen=50)
 debug_log_lock = asyncio.Lock()
@@ -350,6 +403,7 @@ async def lifespan(app: FastAPI):
     await init_global_stats()
     await pool.init_pool_data()
     await groq_pool.restore_from_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
+    await access_manager.initialize(upstash_get_strict_async)
     yield
     await async_client.aclose()
 
@@ -413,13 +467,50 @@ h3 {{ font-size: 16px; line-height: 1.3; }}
 </body>
 </html>"""
 
-def check_auth(request: Request) -> bool:
-    if not CUSTOM_API_KEYS:
-        return True
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return False
-    return auth.replace("Bearer ", "").strip() in CUSTOM_API_KEYS
+async def authenticate_request(request: Request) -> Optional[ClientPrincipal]:
+    await access_manager.refresh_if_due(upstash_get_strict_async)
+    return await access_manager.authenticate(request.headers.get("Authorization"))
+
+def api_error(status_code: int, message: str, error_type: str, code: str, request_id: str = "") -> JSONResponse:
+    content = {"error": {"message": message, "type": error_type, "param": None, "code": code}}
+    if request_id:
+        content["request_id"] = request_id
+    return JSONResponse(status_code=status_code, content=content)
+
+async def authorize_model_request(
+    request: Request, model: str, request_id: str = "", body: Optional[dict] = None
+):
+    principal = await authenticate_request(request)
+    if principal is None:
+        return None, api_error(401, "Unauthorized", "auth_error", "unauthorized", request_id)
+    if not access_manager.authorize(principal, model):
+        return None, api_error(403, f"Model not allowed: {model}", "permission_error", "model_not_allowed", request_id)
+
+    quota = await access_manager.consume(
+        principal,
+        model,
+        body=body,
+        client=async_client,
+        redis_url=UPSTASH_REDIS_REST_URL,
+        redis_token=UPSTASH_REDIS_REST_TOKEN,
+    )
+    if not quota["allowed"]:
+        response = api_error(429, "Client RPM limit exceeded", "rate_limit_error", "client_rpm_exceeded", request_id)
+        response.headers["Retry-After"] = str(quota["retry_after"])
+        response.headers["X-RateLimit-Limit-Requests"] = str(quota["limit_rpm"])
+        response.headers["X-RateLimit-Remaining-Requests"] = "0"
+        return None, response
+    return principal, None
+
+def admin_session_token() -> str:
+    if not ADMIN_API_KEY:
+        return ""
+    return hmac.new(ADMIN_API_KEY.encode("utf-8"), b"cpr-admin-session", hashlib.sha256).hexdigest()
+
+def is_admin_authenticated(request: Request) -> bool:
+    expected = admin_session_token()
+    supplied = request.cookies.get("admin_session", "")
+    return bool(expected and supplied and hmac.compare_digest(expected, supplied))
 
 def get_thinking_display(body: dict) -> bool:
     if "thinkingdisplay" in body:
@@ -520,53 +611,58 @@ async def chat(request: Request):
     start = time.time()
     request_id = str(uuid.uuid4())[:8]
 
-    # 1. 鉴权校验
-    if not check_auth(request):
-        return JSONResponse(status_code=401, content={
-            "error": {"message": "Unauthorized", "type": "auth_error", "param": None, "code": "unauthorized"},
-            "request_id": request_id
-        })
-
-    # 2. 解析请求体
+    # 1. 解析请求体
     try:
         raw = await request.json()
     except Exception:
         raw = {}
 
+    request_model = raw.get("model", DEFAULT_MODEL)
+    principal, auth_error = await authorize_model_request(request, request_model, request_id, raw)
+    if auth_error:
+        return auth_error
+
     async with stats_lock:
         GLOBAL_STATS["total_requests"] += 1
     await save_global_stats_async()
 
-    request_model = raw.get("model", DEFAULT_MODEL)
-
-    # 3. 处理既不在 Cerebras 也不在 Groq 模型列表中的“其他模型”直通逻辑
-    if request_model not in CEREBRAS_MODELS and request_model not in GROQ_MODELS:
-        async with stats_lock:
-            GLOBAL_STATS["other_models_count"] += 1
-        await save_global_stats_async()
-
-        if not CEREBRAS_API_KEYS:
-            return JSONResponse(status_code=500, content={"error": {"message": "No physical keys configured"}})
-        try:
-            r = await async_client.post(
-                f"{CEREBRAS_BASE_URL}/chat/completions",
-                json=raw,
-                headers={"Authorization": f"Bearer {CEREBRAS_API_KEYS[0]}"},
-                timeout=60.0
-            )
-            bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-            await add_debug_log_async({
-                "id": request_id, "time": bj_time, "request_model": request_model,
-                "final_model": request_model, "key": CEREBRAS_API_KEYS[0][-4:], "status_code": r.status_code,
-                "time_cost": round(time.time() - start, 2),
-                "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
-                "response_body": truncate_text(r.text)
-            })
-            return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
+    if request_model not in CEREBRAS_MODELS and request_model not in GROQ_MODELS and request_model not in AGNES_MODELS:
+        return api_error(400, f"Unsupported model: {request_model}", "invalid_request_error", "unsupported_model", request_id)
 
     show_thinking = final_thinking(raw)
+
+    if request_model in AGNES_MODELS:
+        if request_model != AGNES_TEXT_MODEL:
+            return api_error(400, "Use the Agnes image or video endpoint for this model", "invalid_request_error", "wrong_endpoint", request_id)
+
+        agnes_resp, agnes_candidate, agnes_error = await execute_agnes_chat_request(async_client, raw, timeout=120.0)
+        if not agnes_resp or not agnes_candidate:
+            return api_error(503, agnes_error or "Agnes unavailable", "service_unavailable", "agnes_unavailable", request_id)
+        if not 200 <= agnes_resp.status_code < 300:
+            try:
+                return upstream_response(agnes_resp)
+            finally:
+                await agnes_resp.aclose()
+
+        if raw.get("stream", False):
+            async def agnes_stream_gen():
+                try:
+                    async for chunk in sanitize_agnes_sse_stream(agnes_resp, request_model, request_id):
+                        yield chunk
+                finally:
+                    await agnes_resp.aclose()
+                    await finish_log_async(request_id, request_model, agnes_candidate.key, f"agnes:{agnes_candidate.site}", False, start)
+
+            return StreamingResponse(agnes_stream_gen(), media_type="text/event-stream")
+
+        try:
+            result = sanitize_agnes_response(agnes_resp.json(), request_model, request_id)
+            usage = result.get("usage", {})
+            await add_global_usage_async(request_model, usage)
+            await finish_log_async(request_id, request_model, agnes_candidate.key, f"agnes:{agnes_candidate.site}", False, start, usage)
+            return JSONResponse(status_code=agnes_resp.status_code, content=result)
+        finally:
+            await agnes_resp.aclose()
 
     if request_model in GROQ_MODELS:
         groq_resp, groq_model, groq_key = await execute_groq_request(async_client, raw, show_thinking)
@@ -612,7 +708,14 @@ async def chat(request: Request):
         })
 
     # 4. 尝试 Cerebras 模型池轮询
-    models_to_try = [GEMMA_MODEL, GLM_MODEL, GPT_MODEL] if request_model not in CEREBRAS_MODELS else [request_model] + [m for m in CEREBRAS_MODELS if m != request_model]
+    models_to_try = [request_model] + [m for m in CEREBRAS_MODELS if m != request_model]
+    if MODEL_FALLBACK_MODE == "off":
+        models_to_try = [request_model]
+    elif MODEL_FALLBACK_MODE == "force_gpt":
+        if not access_manager.authorize(principal, GPT_MODEL):
+            return api_error(403, f"Model not allowed: {GPT_MODEL}", "permission_error", "model_not_allowed", request_id)
+        models_to_try = [GPT_MODEL]
+    models_to_try = [model for model in models_to_try if access_manager.authorize(principal, model)]
     
     last_error = None
 
@@ -818,7 +921,15 @@ async def chat(request: Request):
                 continue
 
     # 5. Cerebras 全部失败后，降级尝试 Groq
-    groq_resp, groq_model, groq_key = await execute_groq_request(async_client, raw, show_thinking)
+    allowed_groq_models = [model for model in GROQ_MODELS if access_manager.authorize(principal, model)]
+    groq_resp, groq_model, groq_key = (None, None, None)
+    if MODEL_FALLBACK_MODE == "auto":
+        for fallback_model in allowed_groq_models:
+            groq_raw = dict(raw)
+            groq_raw["model"] = fallback_model
+            groq_resp, groq_model, groq_key = await execute_groq_request(async_client, groq_raw, show_thinking)
+            if groq_resp:
+                break
 
     if groq_resp and groq_model and groq_key:
         async with stats_lock:
@@ -876,6 +987,132 @@ async def chat(request: Request):
         "request_id": request_id
     })
 
+def upstream_response(response: httpx.Response) -> Response:
+    content_type = response.headers.get("content-type", "application/json").split(";", 1)[0]
+    return Response(content=response.content, status_code=response.status_code, media_type=content_type)
+
+def agnes_media_response(response: httpx.Response, public_model: str) -> Response:
+    try:
+        data = response.json()
+        if isinstance(data, dict) and "model" in data:
+            data["model"] = public_model
+        return JSONResponse(content=data, status_code=response.status_code)
+    except Exception:
+        return upstream_response(response)
+
+@app.post("/v1/images/generations")
+async def agnes_images(request: Request):
+    request_id = str(uuid.uuid4())[:8]
+    try:
+        body = await request.json()
+    except Exception:
+        return api_error(400, "Invalid JSON body", "invalid_request_error", "invalid_json", request_id)
+
+    model = body.get("model", AGNES_IMAGE_MODEL)
+    if model != AGNES_IMAGE_MODEL:
+        return api_error(400, f"Unsupported image model: {model}", "invalid_request_error", "unsupported_model", request_id)
+    _, auth_error = await authorize_model_request(request, model, request_id, body)
+    if auth_error:
+        return auth_error
+
+    response, candidate, error = await execute_agnes_request(
+        async_client, "POST", "/images/generations", body=body,
+        public_model=model, timeout=360.0,
+    )
+    if response is None:
+        return api_error(503, error or "Agnes image service unavailable", "service_unavailable", "agnes_unavailable", request_id)
+    try:
+        if not 200 <= response.status_code < 300:
+            return upstream_response(response)
+        async with stats_lock:
+            GLOBAL_STATS["agnes_requests"] = GLOBAL_STATS.get("agnes_requests", 0) + 1
+        await save_global_stats_async()
+        return agnes_media_response(response, model)
+    finally:
+        await response.aclose()
+
+@app.post("/v1/videos")
+async def agnes_videos(request: Request):
+    request_id = str(uuid.uuid4())[:8]
+    try:
+        body = await request.json()
+    except Exception:
+        return api_error(400, "Invalid JSON body", "invalid_request_error", "invalid_json", request_id)
+
+    model = body.get("model", AGNES_VIDEO_MODEL)
+    if model != AGNES_VIDEO_MODEL:
+        return api_error(400, f"Unsupported video model: {model}", "invalid_request_error", "unsupported_model", request_id)
+    principal, auth_error = await authorize_model_request(request, model, request_id, body)
+    if auth_error:
+        return auth_error
+    if principal.is_open:
+        return api_error(401, "Agnes video endpoints require a configured client key", "auth_error", "video_auth_required", request_id)
+
+    response, candidate, error = await execute_agnes_request(
+        async_client, "POST", "/videos", body=body,
+        public_model=model, timeout=120.0,
+    )
+    if response is None:
+        return api_error(503, error or "Agnes video service unavailable", "service_unavailable", "agnes_unavailable", request_id)
+    try:
+        if not 200 <= response.status_code < 300:
+            return upstream_response(response)
+        try:
+            result_data = response.json()
+        except Exception:
+            result_data = {}
+        owner_data = {
+            "client_id": principal.client_id,
+            "candidate_index": candidate.index,
+        }
+        task_identifiers = {
+            str(value) for value in (
+                result_data.get("video_id"), result_data.get("task_id"), result_data.get("id")
+            ) if value
+        }
+        for task_identifier in task_identifiers:
+            await save_video_owner(task_identifier, owner_data)
+        async with stats_lock:
+            GLOBAL_STATS["agnes_requests"] = GLOBAL_STATS.get("agnes_requests", 0) + 1
+        await save_global_stats_async()
+        return agnes_media_response(response, model)
+    finally:
+        await response.aclose()
+
+@app.get("/v1/videos/{task_id}")
+@app.get("/agnesapi")
+async def agnes_video_result(request: Request, task_id: Optional[str] = None, video_id: Optional[str] = None):
+    lookup_id = video_id or task_id
+    if not lookup_id:
+        return api_error(400, "video_id or task_id is required", "invalid_request_error", "missing_video_id")
+
+    principal = await authenticate_request(request)
+    if principal is None:
+        return api_error(401, "Unauthorized", "auth_error", "unauthorized")
+    if principal.is_open:
+        return api_error(401, "Agnes video endpoints require a configured client key", "auth_error", "video_auth_required")
+    if not access_manager.authorize(principal, AGNES_VIDEO_MODEL):
+        return api_error(403, "Model not allowed", "permission_error", "model_not_allowed")
+
+    owner = await get_video_owner(lookup_id)
+    if not owner:
+        return api_error(404, "Video task not found", "invalid_request_error", "video_task_not_found")
+    if owner.get("client_id") != principal.client_id:
+        return api_error(403, "Video task not owned by this key", "permission_error", "video_task_forbidden")
+
+    query = dict(request.query_params)
+    query.pop("video_id", None)
+    response, candidate, error = await query_agnes_video_result(
+        async_client, lookup_id, query=query, timeout=60.0,
+        candidate_index=owner.get("candidate_index"),
+    )
+    if response is None:
+        return api_error(503, error or "Agnes video result unavailable", "service_unavailable", "agnes_unavailable")
+    try:
+        return agnes_media_response(response, AGNES_VIDEO_MODEL)
+    finally:
+        await response.aclose()
+
 @app.get("/menu", response_class=HTMLResponse)
 @app.get("/", response_class=HTMLResponse)
 async def menu():
@@ -886,11 +1123,14 @@ async def menu():
 <h3>📌 API Endpoint</h3>
 <p>🔗 <a href="/v1/models" target="_blank">/v1/models (查看可用模型列表)</a></p>
 <p> <code>POST /v1/chat/completions</code> (标准 OpenAI 格式网关)</p>
+<p> <code>POST /v1/images/generations</code> (Agnes 图片生成)</p>
+<p> <code>POST /v1/videos</code> (Agnes 视频任务)</p>
 <h3>📊 监控中心 (Monitor)</h3>
 <p>📈 <a href="/status">/status (实时上游限额 & 物理Key高级看板)</a></p>
 <p>📜 <a href="/log">/log (最近 100 条请求历史)</a></p>
 <p>🔍 <a href="/debug">/debug (最近 50 条全量请求体/响应体深度调试)</a></p>
 <p>⚙️ <a href="/config">/config (系统核心配置)</a></p>
+<p>🔐 <a href="/admin">/admin (客户端 Key 与贡献额度管理)</a></p>
 <p>❤️ <a href="/health">/health (微服务健康检查)</a></p>
 <h3>🎛️ 控制策略 (Control Center)</h3>
 <p>⚙️ <a href="/thinkingdisplay">/thinkingdisplay (深度思考输出控制: {THINKING_MODE.upper()})</a></p>
@@ -899,12 +1139,14 @@ async def menu():
 <pre style="background:#1f2937; padding:12px; border-radius:6px; border:1px solid #374151;">
 Cerebras ({len(CEREBRAS_MODELS)}): {', '.join(CEREBRAS_MODELS)}
 Groq ({len(GROQ_MODELS)}): {', '.join(GROQ_MODELS)}
+Agnes ({len(AGNES_MODELS)}): {', '.join(AGNES_MODELS)}
 </pre>"""
     return HTMLResponse(content=html_page("Menu", body))
 
 @app.get("/status", response_class=HTMLResponse)
 async def status():
     now = time.time()
+    agnes_metrics = await get_agnes_metrics()
     
     # --- Cerebras 限额统计 ---
     cerebras_global_limits = {m: {"rpm": 0, "rpd": 0, "tpm": 0, "tpd": 0, "cur_rpm": 0, "cur_rpd": 0, "cur_tpm": 0, "cur_tpd": 0} for m in CEREBRAS_MODELS}
@@ -1064,6 +1306,24 @@ async def status():
         html += "<p class='tag'>未配置 GROQ_API_KEYS</p>"
     html += "</div>"
 
+    html += "<h3>🌐 Agnes 双站 API-Key 状态</h3><div class='grid-2'>"
+    if agnes_metrics["candidates"]:
+        for candidate in agnes_metrics["candidates"]:
+            status_badge = f'<span class="badge badge-red">冷却 ({candidate["cooldown"]}s)</span>' if candidate["cooldown"] else '<span class="badge badge-green">正常</span>'
+            model_lines = "".join(
+                f'<div>{html_lib.escape(bucket)}: {data["current_rpm"]}/{data["limit_rpm"]} RPM</div>'
+                for bucket, data in candidate["models"].items()
+            )
+            html += f"""
+            <div class="card" style="border-left:4px solid #10b981;">
+                <div style="display:flex;justify-content:space-between;gap:8px;"><strong>{candidate['site'].upper()} ****{candidate['key_suffix']}</strong>{status_badge}</div>
+                <div class="tag" style="margin:8px 0;">累计尝试: {candidate['request_total']}</div>
+                <div style="font-size:11px;display:grid;grid-template-columns:1fr 1fr;gap:5px;">{model_lines}</div>
+            </div>"""
+    else:
+        html += "<p class='tag'>未配置 Agnes API Keys</p>"
+    html += "</div>"
+
     return HTMLResponse(content=html_page("Status 看板", html))
 
 @app.get("/log", response_class=HTMLResponse)
@@ -1161,6 +1421,7 @@ async def debug(request: Request, password: Optional[str] = Form(None), debug_au
 
 @app.get("/config", response_class=HTMLResponse)
 async def config():
+    agnes_counts = get_agnes_counts()
     body = f"""<h2>⚙️ 系统当前全局运行配置</h2>
 <pre style='background:#1f2937; color:#f3f4f6; padding:15px; border-radius:6px; border:1px solid #374151;'>
 网关核心版本: {VERSION}
@@ -1168,11 +1429,115 @@ async def config():
 全局默认模型: {DEFAULT_MODEL}
 Cerebras Key 总计: {len(CEREBRAS_API_KEYS)} 个
 Groq Key 总计: {len(groq_pool.keys)} 个
+Agnes 中国站 Key: {agnes_counts['keys_by_site'].get('cn', 0)} 个
+Agnes 国际站 Key: {agnes_counts['keys_by_site'].get('intl', 0)} 个
 思考强控制模式 (Thinking): {THINKING_MODE.upper()}
 模型自动降级模式 (Fallback): {MODEL_FALLBACK_MODE.upper()}
 Upstash 持久化状态: {'🟢 已启用' if UPSTASH_REDIS_REST_URL else '⚪ 本地JSON模式'}
 </pre>"""
     return HTMLResponse(content=html_page("Config 配置", body))
+
+@app.api_route("/admin", methods=["GET", "POST"], response_class=HTMLResponse)
+async def admin_page(request: Request):
+    if not ADMIN_API_KEY:
+        return HTMLResponse(content=html_page("Admin", "<h2>Admin 未启用</h2><p>请先设置 <code>ADMIN_API_KEY</code>。</p>"), status_code=503)
+
+    message = ""
+    generated_key = ""
+    form = await request.form() if request.method == "POST" else {}
+
+    if request.method == "POST" and form.get("action") == "login":
+        supplied = str(form.get("admin_key", ""))
+        if hmac.compare_digest(supplied, ADMIN_API_KEY):
+            response = HTMLResponse(content=html_page("Admin", "<h2>登录成功</h2><p><a href='/admin'>进入管理页面</a></p>"))
+            response.set_cookie(
+                "admin_session", admin_session_token(), max_age=86400,
+                httponly=True, secure=request.url.scheme == "https", samesite="strict",
+            )
+            return response
+        message = "管理员密钥错误"
+
+    if not is_admin_authenticated(request):
+        login = f"""
+        <h2>🔐 Gateway Admin</h2>
+        <p style="color:#f87171;">{html_lib.escape(message)}</p>
+        <form method="POST">
+            <input type="hidden" name="action" value="login"/>
+            <input type="password" name="admin_key" placeholder="ADMIN_API_KEY" required style="width:min(360px,100%); box-sizing:border-box; padding:10px; background:#1f2937; color:#fff; border:1px solid #374151; border-radius:4px;"/>
+            <button type="submit" style="padding:10px 16px; background:#2563eb; color:#fff; border:0; border-radius:4px;">登录</button>
+        </form>"""
+        return HTMLResponse(content=html_page("Admin 登录", login), status_code=401 if message else 200)
+
+    if request.method == "POST" and form.get("action") != "login":
+        csrf = str(form.get("csrf", ""))
+        if not hmac.compare_digest(csrf, admin_session_token()):
+            return HTMLResponse(content=html_page("Admin", "<h2>请求已拒绝</h2><p>CSRF 校验失败。</p>"), status_code=403)
+        if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+            message = "未配置 Upstash，Admin 当前为只读模式"
+        else:
+            action = str(form.get("action", ""))
+            if action == "create":
+                allowed_models = [m.strip() for m in str(form.get("allowed_models", "")).split(",") if m.strip()]
+                created = await access_manager.create({
+                    "name": str(form.get("name", "")),
+                    "scope": str(form.get("scope", "all")),
+                    "contributions": str(form.get("contributions", "1")),
+                    "allowed_models": allowed_models or None,
+                    "enabled": True,
+                }, upstash_set_async)
+                if created:
+                    generated_key = created["key"]
+                    message = "Key 创建成功，仅在本页显示一次"
+                else:
+                    message = "Key 创建失败"
+            elif action == "toggle":
+                ok = await access_manager.update_by_client_id(
+                    str(form.get("client_id", "")),
+                    {"enabled": str(form.get("enabled", "false")).lower() == "true"},
+                    upstash_set_async,
+                )
+                message = "状态已更新" if ok else "状态更新失败"
+            elif action == "delete":
+                ok = await access_manager.delete_by_client_id(str(form.get("client_id", "")), upstash_set_async)
+                message = "Key 已删除或禁用" if ok else "删除失败"
+
+    clients = await access_manager.list_clients()
+    rows = []
+    csrf = admin_session_token()
+    for item in clients:
+        models = ", ".join(item["allowed_models"] or ["全部允许范围内模型"])
+        next_enabled = "false" if item["enabled"] else "true"
+        rows.append(f"""
+        <tr>
+            <td>{html_lib.escape(item['name'] or '-')}</td><td>{html_lib.escape(item['scope'])}</td>
+            <td>{item['contributions']}</td><td>****{html_lib.escape(item['key_suffix'])}</td>
+            <td>{html_lib.escape(models)}</td><td>{'启用' if item['enabled'] else '禁用'}</td>
+            <td style="white-space:nowrap;">
+                <form method="POST" style="display:inline;"><input type="hidden" name="csrf" value="{csrf}"/><input type="hidden" name="action" value="toggle"/><input type="hidden" name="client_id" value="{item['client_id']}"/><input type="hidden" name="enabled" value="{next_enabled}"/><button type="submit">{'禁用' if item['enabled'] else '启用'}</button></form>
+                <form method="POST" style="display:inline;"><input type="hidden" name="csrf" value="{csrf}"/><input type="hidden" name="action" value="delete"/><input type="hidden" name="client_id" value="{item['client_id']}"/><button type="submit">删除</button></form>
+            </td>
+        </tr>""")
+
+    generated_html = f"<pre style='background:#065f46;padding:12px;'>{html_lib.escape(generated_key)}</pre>" if generated_key else ""
+    readonly = "<p style='color:#f59e0b;'>未配置 Upstash，动态配置不可写。</p>" if not UPSTASH_REDIS_REST_URL else ""
+    body = f"""
+    <h2>🔑 客户端 Key 管理</h2>
+    <p>{html_lib.escape(message)}</p>{generated_html}{readonly}
+    <h3>创建 Key</h3>
+    <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
+        <input type="hidden" name="csrf" value="{csrf}"/><input type="hidden" name="action" value="create"/>
+        <input name="name" placeholder="名称/备注" required/>
+        <select name="scope"><option value="all">通用 all</option><option value="agnes">仅 Agnes</option></select>
+        <input name="contributions" type="number" min="1" max="100" value="1" required/>
+        <input name="allowed_models" placeholder="允许模型，逗号分隔；留空表示范围内全部"/>
+        <button type="submit">生成 Key</button>
+    </form>
+    <h3 style="margin-top:20px;">现有 Key</h3>
+    <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
+    <tr><th>名称</th><th>范围</th><th>贡献数</th><th>Key</th><th>允许模型</th><th>状态</th><th>操作</th></tr>
+    {''.join(rows) if rows else '<tr><td colspan="7">暂无 Key</td></tr>'}
+    </table></div>"""
+    return HTMLResponse(content=html_page("Admin", body))
 
 @app.get("/thinkingdisplay", response_class=HTMLResponse)
 async def thinkingdisplay_page(mode: Optional[str] = None):
@@ -1206,21 +1571,31 @@ async def fallbackmode_page(mode: Optional[str] = None):
     return HTMLResponse(content=html_page("Fallback Control", body))
 
 @app.get("/v1/models")
-async def models():
+async def models(request: Request):
+    principal = await authenticate_request(request)
+    if principal is None:
+        return api_error(401, "Unauthorized", "auth_error", "unauthorized")
     models_list = [
         {"id": m, "object": "model", "created": 1700000000, "owned_by": "cerebras"}
         for m in CEREBRAS_MODELS
     ] + [
         {"id": m, "object": "model", "created": 1700000000, "owned_by": "groq"}
         for m in GROQ_MODELS
+    ] + [
+        {"id": m, "object": "model", "created": 1700000000, "owned_by": "agnes"}
+        for m in AGNES_MODELS
     ]
+    models_list = [item for item in models_list if access_manager.authorize(principal, item["id"])]
     return JSONResponse(content={"object": "list", "data": models_list})
 
 @app.get("/health")
 async def health():
+    agnes_counts = get_agnes_counts()
     return JSONResponse(content={
         "status": "ok", 
         "version": VERSION, 
         "cerebras_keys": len(CEREBRAS_API_KEYS),
-        "groq_keys": len(groq_pool.keys)
+        "groq_keys": len(groq_pool.keys),
+        "agnes_cn_keys": agnes_counts["keys_by_site"].get("cn", 0),
+        "agnes_intl_keys": agnes_counts["keys_by_site"].get("intl", 0)
     })

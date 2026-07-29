@@ -1,6 +1,6 @@
-# Cerebras OpenAI API Gateway 2.0.4
+# Cerebras OpenAI API Gateway 2.0.5
 
-> 极速、高可用、多 Key 轮询与智能降级的 Cerebras 到 OpenAI 格式 API 转接网关。
+> 聚合 Cerebras、Groq 和 Agnes 的 OpenAI 兼容网关，支持多 Key 轮询、模型权限和贡献额度管理。
 
 ![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)
 ![Framework](https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg)
@@ -17,6 +17,9 @@
 - **多物理 Key 智能轮询 (Key Pool)**：支持配置多个 Cerebras API-Key，自动负载均衡、计算限额并在遇到 `429 Too Many Requests` 时自动触发 60s 智能冷却隔离。
 - **智能模型自动降级 (Fallback System)**：当上游 GLM 模型 (`zai-glm-4.7`) 发生限流或异常时，可无缝无感自动降级至 GPT 模型 (`gpt-oss-120b`) 接管响应。
 - **Groq 兼容降级 (Groq Fallback)**：Cerebras 全部失败后，自动切换到 Groq 托管模型，继续提供 OpenAI 兼容响应。
+- **Agnes 双站轮询**：中国站和国际站分别配置物理 Key，按“站点 + Key”候选节点轮询，支持文本、图片和异步视频接口。
+- **客户端 Key 权限**：支持通用 Key、仅 Agnes Key 和精确模型白名单；`/v1/models` 只返回当前 Key 有权调用的模型。
+- **贡献额度**：每个客户端 Key 独立计算 Agnes RPM，公式为 `官方实际 RPM × 贡献数量 × 2`，Vercel 环境可通过 Upstash 原子计数。
 - **思考过程深度控制 (Thinking Control)**：支持 `AUTO` / `ON` / `OFF` 三档控制，可一键全局强行抹除思考推理过程，极致节省 Token 消耗与响应耗时。
 - **可视化监控与深度调试**：提供极简黑夜风格看板，实时查看所有 Key 的 RPM/RPD/TPM/TPD 水位线、最近 100 条请求历史，以及支持同时打包 Request 与 Response 的一键调试包复制。
 - **OpenCode / Cursor 兼容**：补齐 OpenAI 标准模型列表与流式字段，便于编辑器直接识别并接入。
@@ -36,6 +39,17 @@
 | `/fallbackmode` | GLM -> GPT 自动降级策略切换 (`AUTO` / `OFF` / `FORCE_GPT`) |
 | `/log` | 最近 100 条请求日志回溯 |
 | `/debug` | 最近 50 条全量 Request/Response 抓包与一键打包复制 AI 调试信息 |
+| `/admin` | 创建、启用、禁用和删除客户端 Key，配置权限范围、模型白名单和贡献数量 |
+
+### Agnes API 路由
+
+| 路由 | 模型 | 说明 |
+| :--- | :--- | :--- |
+| `POST /v1/chat/completions` | `agnes/agnes-2.5-flash` | OpenAI 兼容文本与流式响应 |
+| `POST /v1/images/generations` | `agnes/agnes-image-2.1-flash` | 图片生成或图片编辑 |
+| `POST /v1/videos` | `agnes/agnes-video-v2.0` | 创建异步视频任务 |
+| `GET /agnesapi?video_id=...` | `agnes/agnes-video-v2.0` | 查询视频任务结果 |
+| `GET /v1/videos/{task_id}` | `agnes/agnes-video-v2.0` | 兼容旧版任务查询 |
 
 ---
 
@@ -47,11 +61,44 @@
 | :--- | :---: | :---: | :--- |
 | `CEREBRAS_API_KEYS` | **是** | - | 物理 Cerebras API Key，多个用英文逗号分隔，如 `csk-key1,csk-key2` |
 | `GROQ_API_KEYS` | 否 | - | Groq API Key，多个用英文逗号分隔，如 `gsk-key1,gsk-key2` |
-| `CUSTOM_API_KEYS` | 否 | - | 自定义客户端鉴权 Key（设置后客户端请求必须携带 `Bearer <Key>`） |
+| `AGNES_CN_API_KEYS` | 否 | - | Agnes 中国站 Key，固定用于 `api.agnes-ai.cn`，多个用逗号分隔 |
+| `AGNES_INTL_API_KEYS` | 否 | - | Agnes 国际站 Key，固定用于 `apihub.agnes-ai.com`，多个用逗号分隔 |
+| `CUSTOM_API_KEYS` | 否 | - | 旧版通用客户端 Key，贡献数量固定为 1 |
+| `GATEWAY_KEYS_JSON` | 否 | - | 客户端 Key 结构化初始配置，可设置范围、模型白名单和贡献数量 |
+| `ADMIN_API_KEY` | 否 | - | `/admin` 独立管理员登录密钥 |
 | `UPSTASH_REDIS_REST_URL` | 否 | - | Upstash Redis REST URL（开启云端数据持久化） |
 | `UPSTASH_REDIS_REST_TOKEN` | 否 | - | Upstash Redis REST Token |
 | `THINKING_MODE` | 否 | `auto` | 思考模式强控：`auto` / `on` / `off` |
 | `MODEL_FALLBACK_MODE` | 否 | `auto` | 自动降级模式：`auto` / `off` / `force_gpt` |
+
+结构化客户端 Key 示例：
+
+```json
+{
+  "cpr_all_c1_replace-with-random-secret": {
+    "name": "通用用户",
+    "scope": "all",
+    "contributions": 1,
+    "enabled": true
+  },
+  "cpr_agnes_c2_replace-with-random-secret": {
+    "name": "Agnes 贡献者",
+    "scope": "agnes",
+    "contributions": 2,
+    "allowed_models": [
+      "agnes/agnes-2.5-flash",
+      "agnes/agnes-image-2.1-flash"
+    ],
+    "enabled": true
+  }
+}
+```
+
+Key 名称中的 `c2` 仅用于辨识，服务端实际额度始终读取配置中的 `contributions`。Admin 页面生成的动态 Key 需要 Upstash 持久化；未配置 Upstash 时 Admin 为只读模式。
+
+Agnes 免费/default 官方实际 RPM：文本 20；图片 1K/2K/3K/4K 分别为 20/10/1/1；视频为 1。中国站和国际站分别作为独立限制池，同一站点配置多个 API Key 不会叠加官方 RPM。
+
+视频任务会绑定创建它的客户端 Key 和上游站点，查询结果时必须使用同一个客户端 Key。因此 `/v1/videos` 和视频结果查询接口不支持匿名开放模式。
 
 ---
 
@@ -154,6 +201,11 @@ export default {
   - `zai-glm-4.7`
   - `gpt-oss-120b`
   - Groq 模型列表见 `/v1/models`
+  - `agnes/agnes-2.5-flash`
+  - `agnes/agnes-image-2.1-flash`
+  - `agnes/agnes-video-v2.0`
+
+Agnes 付费模型 `agnes-2.5-pro-alpha` 未纳入托管列表。
 
 ---
 
