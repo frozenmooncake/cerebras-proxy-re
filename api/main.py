@@ -559,7 +559,12 @@ h3 {{ font-size: 16px; line-height: 1.3; }}
 
 async def authenticate_request(request: Request) -> Optional[ClientPrincipal]:
     await access_manager.refresh_if_due(upstash_get_strict_async)
-    return await access_manager.authenticate(request.headers.get("Authorization"))
+    authorization = request.headers.get("Authorization")
+    if not authorization:
+        api_key = request.headers.get("X-API-Key") or request.headers.get("api-key")
+        if api_key:
+            authorization = "Bearer " + api_key.strip()
+    return await access_manager.authenticate(authorization)
 
 def api_error(status_code: int, message: str, error_type: str, code: str, request_id: str = "") -> JSONResponse:
     content = {"error": {"message": message, "type": error_type, "param": None, "code": code}}

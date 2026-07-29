@@ -69,6 +69,29 @@ class GatewaySecurityTests(unittest.TestCase):
 
 
 class CatalogAndAccessTests(unittest.TestCase):
+    def setUp(self):
+        self.client = TestClient(main.app)
+
+    def test_models_uses_client_key_not_admin_session(self):
+        response = self.client.get(
+            "/v1/models", headers={"Authorization": "Bearer contributor-a"}
+        )
+        self.assertEqual(response.status_code, 200)
+        model_ids = [item["id"] for item in response.json()["data"]]
+        self.assertIn("gpt-oss-120b", model_ids)
+        self.assertIn("openai/gpt-oss-120b", model_ids)
+        self.assertNotIn("agnes/agnes-2.5-flash", model_ids)
+
+    def test_models_supports_x_api_key_header(self):
+        response = self.client.get(
+            "/v1/models", headers={"X-API-Key": "contributor-a"}
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_models_rejects_missing_client_key(self):
+        response = self.client.get("/v1/models")
+        self.assertEqual(response.status_code, 401)
+
     def test_catalog_models_are_unique_and_classified(self):
         self.assertEqual(len(catalog.MODEL_CATALOG), len(set(catalog.MODEL_CATALOG)))
         for model_id, spec in catalog.MODEL_CATALOG.items():

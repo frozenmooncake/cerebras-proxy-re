@@ -215,6 +215,7 @@ export default {
 - **API 协议**：OpenAI
 - **API Base URL**：`https://你的接入域名/v1`
 - **API Key**：若设置了 `CUSTOM_API_KEYS` 填写对应密钥；未设置可随意填写 `sk-123456`
+- **模型列表鉴权**：`GET /v1/models` 使用客户端 Key，不需要 Admin 登录；支持标准 `Authorization: Bearer <Key>`，并兼容 `X-API-Key` / `api-key`
 - **可用模型**：
   - `gemma-4-31b`
   - `zai-glm-4.7`
