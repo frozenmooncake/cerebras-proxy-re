@@ -21,7 +21,7 @@ load_dotenv()
 # ======================================================
 # VERSION & CHANGELOG
 # ======================================================
-VERSION = "2.0.2-FastAPI-OpenCodeCompatible"  # 兼容 OpenCode / Cursor 编辑器标准规范
+VERSION = "2.0.3"
 
 # ======================================================
 # CONFIG & MODES
@@ -221,10 +221,10 @@ class AsyncKeyPool:
                     "last_reset_date": h_date,   
                     "req_timestamps": deque(),
                     "token_timestamps": deque(),
-                    "limit_rpm": 60,
-                    "limit_rpd": 1000,
-                    "limit_tpm": 6000000,
-                    "limit_tpd": 6000000,
+                    "limit_rpm": 5,
+                    "limit_rpd": 2400,
+                    "limit_tpm": 30000,
+                    "limit_tpd": 1000000,
                     "has_synced": False
                 }
 
