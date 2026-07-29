@@ -381,6 +381,8 @@ a {{ color:#3b82f6; text-decoration:none; transition: color 0.2s; }}
 a:hover {{ color:#60a5fa; text-decoration:underline; }}
 .box {{ max-width: 1200px; margin: 0 auto 20px auto; border: 1px solid #1e293b; border-radius:12px; padding:24px; background: #111827; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.2); }}
 h2, h3 {{ color: #ffffff; margin-top:0; border-bottom: 1px solid #1e293b; padding-bottom: 8px; }}
+pre, code {{ white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-width: 100%; }}
+pre {{ overflow-x: auto; line-height: 1.6; }}
 .nav {{ max-width: 1200px; margin: 20px auto; font-weight: bold; text-align: center; }}
 .nav-btn {{ display: inline-block; padding: 10px 20px; background: #1f2937; color: #fff; border: 1px solid #374151; border-radius: 6px; }}
 .nav-btn:hover {{ background: #374151; }}
@@ -393,6 +395,16 @@ h2, h3 {{ color: #ffffff; margin-top:0; border-bottom: 1px solid #1e293b; paddin
 .badge-green {{ background: #065f46; color: #34d399; }}
 .badge-red {{ background: #991b1b; color: #f87171; }}
 .tag {{ color: #9ca3af; font-size: 12px; }}
+@media (max-width: 640px) {{
+body {{ padding: 10px; }}
+.box {{ padding: 14px; border-radius: 8px; }}
+h2 {{ font-size: 20px; line-height: 1.3; }}
+h3 {{ font-size: 16px; line-height: 1.3; }}
+.grid-2 {{ grid-template-columns: minmax(0, 1fr); gap: 12px; }}
+.card {{ padding: 12px; }}
+.metric-row {{ align-items: flex-start; gap: 8px; }}
+.nav-btn {{ width: 100%; box-sizing: border-box; }}
+}}
 </style>
 </head>
 <body>
