@@ -11,12 +11,14 @@ from typing import Any, Awaitable, Callable, Deque, Dict, List, Mapping, Optiona
 
 import httpx
 
+try:
+    from .model_catalog import AGNES_IMAGE_MODEL, AGNES_VIDEO_MODEL, get_model_spec
+except ImportError:
+    from model_catalog import AGNES_IMAGE_MODEL, AGNES_VIDEO_MODEL, get_model_spec
+
 
 POLICIES_STORAGE_KEY = "gateway_access_policies"
-AGNES_IMAGE_MODEL = "agnes/agnes-image-2.1-flash"
-AGNES_VIDEO_MODEL = "agnes/agnes-video-v2.0"
 IMAGE_LIMITS = {"1K": 20, "2K": 10, "3K": 1, "4K": 1}
-CEREBRAS_MODELS = {"gemma-4-31b", "zai-glm-4.7", "gpt-oss-120b"}
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,12 @@ def _stored_client_id(identifier: str) -> str:
     if identifier.startswith("sha256:"):
         return identifier[7:23]
     return _client_id(identifier)
+
+
+def _persisted_identifier(identifier: str) -> str:
+    if identifier.startswith("sha256:"):
+        return identifier
+    return "sha256:" + hashlib.sha256(identifier.encode("utf-8")).hexdigest()
 
 
 def _normalize_policy(raw: Any) -> Dict[str, Any]:
@@ -129,11 +137,8 @@ class AccessManager:
 
     @staticmethod
     def provider_for_model(model: str) -> str:
-        if model.startswith("agnes/"):
-            return "agnes"
-        if model in CEREBRAS_MODELS:
-            return "cerebras"
-        return "groq"
+        spec = get_model_spec(model)
+        return spec.provider if spec else ""
 
     @staticmethod
     def _principal(secret: str, policy: Mapping[str, Any]) -> ClientPrincipal:
@@ -157,9 +162,10 @@ class AccessManager:
             stored = await _call(getter, POLICIES_STORAGE_KEY)
         except Exception:
             async with self._lock:
-                self._storage_unavailable = True
-                self._persisted_policies = {}
-                self._policies = dict(self._environment_policies)
+                if self._last_refresh == 0.0:
+                    self._storage_unavailable = not bool(self._environment_policies)
+                    self._persisted_policies = {}
+                    self._policies = dict(self._environment_policies)
             return
         if isinstance(stored, str):
             try:
@@ -214,10 +220,10 @@ class AccessManager:
             if not separator or scheme.lower() != "bearer" or not secret.strip():
                 return None
             secret = secret.strip()
-            policy = self._policies.get(secret)
+            digest_key = _persisted_identifier(secret)
+            policy = self._policies.get(digest_key)
             if policy is None:
-                digest_key = "sha256:" + hashlib.sha256(secret.encode("utf-8")).hexdigest()
-                policy = self._policies.get(digest_key)
+                policy = self._policies.get(secret)
             if policy is None or not policy.get("enabled", True):
                 return None
             return self._principal(secret, policy)
@@ -312,8 +318,10 @@ class AccessManager:
 
     async def list_clients(self) -> List[Dict[str, Any]]:
         async with self._lock:
-            return [
-                {
+            clients = {}
+            for secret, policy in self._policies.items():
+                client_id = _stored_client_id(secret)
+                clients[client_id] = {
                     "client_id": _stored_client_id(secret),
                     "key_suffix": policy.get("_key_suffix") or _suffix(secret),
                     "name": policy["name"],
@@ -321,14 +329,19 @@ class AccessManager:
                     "allowed_models": list(policy["allowed_models"]) if policy["allowed_models"] else None,
                     "enabled": policy["enabled"],
                 }
-                for secret, policy in self._policies.items()
-            ]
+            return list(clients.values())
 
     def _secret_by_client_id(self, client_id: str) -> Optional[str]:
         for secret in self._policies:
             if _stored_client_id(secret) == client_id:
                 return secret
         return None
+
+    def _secrets_by_client_id(self, client_id: str) -> List[str]:
+        return [
+            secret for secret in self._policies
+            if _stored_client_id(secret) == client_id
+        ]
 
     async def update_by_client_id(
         self, client_id: str, policy: Mapping[str, Any], setter: Callable[..., Any]
@@ -340,7 +353,12 @@ class AccessManager:
             current = dict(self._policies[secret])
             current.update(policy)
             updated = dict(self._persisted_policies)
-            updated[secret] = _normalize_policy(current)
+            persisted_key = _persisted_identifier(secret)
+            for existing in self._secrets_by_client_id(client_id):
+                updated.pop(existing, None)
+            normalized = _normalize_policy(current)
+            normalized["_key_suffix"] = normalized.get("_key_suffix") or _suffix(secret)
+            updated[persisted_key] = normalized
             if not await self._persist(setter, updated):
                 return False
             self._persisted_policies = updated
@@ -350,16 +368,21 @@ class AccessManager:
 
     async def delete_by_client_id(self, client_id: str, setter: Callable[..., Any]) -> bool:
         async with self._lock:
-            secret = self._secret_by_client_id(client_id)
-            if secret is None:
+            secrets = self._secrets_by_client_id(client_id)
+            if not secrets:
                 return False
+            secret = secrets[-1]
             updated = dict(self._persisted_policies)
-            if secret in self._environment_policies:
+            for existing in secrets:
+                updated.pop(existing, None)
+            environment_secret = next(
+                (item for item in secrets if item in self._environment_policies), None
+            )
+            if environment_secret:
                 disabled = dict(self._policies[secret])
                 disabled["enabled"] = False
-                updated[secret] = disabled
-            else:
-                updated.pop(secret, None)
+                disabled["_key_suffix"] = disabled.get("_key_suffix") or _suffix(environment_secret)
+                updated[_persisted_identifier(environment_secret)] = disabled
             if not await self._persist(setter, updated):
                 return False
             self._persisted_policies = updated
@@ -377,11 +400,12 @@ class AccessManager:
         if model == AGNES_VIDEO_MODEL:
             return "agnes", model, 1, None
         provider = AccessManager.provider_for_model(model)
+        spec = get_model_spec(model)
+        if spec is None:
+            return "", model, 0, None
         if provider == "agnes":
-            return provider, model, 20, None
-        if provider == "cerebras":
-            return provider, provider, 5, 30000
-        return provider, provider, 30, 40000
+            return provider, model, spec.base_rpm, spec.base_tpm
+        return provider, provider, spec.base_rpm, spec.base_tpm
 
     @staticmethod
     def _redis_result(data: Any, index: int) -> Optional[int]:

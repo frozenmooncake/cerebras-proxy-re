@@ -24,31 +24,32 @@ load_dotenv()
 # Vercel: 确保同目录模块可被 import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from groq_provider import execute_groq_request, sanitize_groq_response, sanitize_sse_stream, GROQ_MODELS, groq_pool
-from agnes_provider import (
+from model_catalog import (
     AGNES_IMAGE_MODEL,
     AGNES_MODELS,
     AGNES_TEXT_MODEL,
     AGNES_VIDEO_MODEL,
-    execute_agnes_chat_request,
-    execute_agnes_request,
+    CEREBRAS_MODELS,
+    GEMMA_MODEL,
+    GLM_MODEL,
+    GPT_MODEL,
+    GROQ_MODELS,
+    MODEL_CATALOG,
+    get_model_spec,
+)
+from groq_provider import groq_pool
+from agnes_provider import (
     get_agnes_counts,
     get_agnes_metrics,
-    query_agnes_video_result,
-    sanitize_agnes_response,
-    sanitize_agnes_sse_stream,
 )
+from provider_adapters import AgnesAdapter, GroqAdapter
 from access_control import ClientPrincipal, access_manager
+from distributed_limits import admit_fixed_window
 
-VERSION = "2.0.7-FastAPI"
+VERSION = "2.1.0-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
-GEMMA_MODEL = "gemma-4-31b"
-GLM_MODEL = "zai-glm-4.7"
-GPT_MODEL = "gpt-oss-120b"
-
 DEFAULT_MODEL = GPT_MODEL
-CEREBRAS_MODELS = [GEMMA_MODEL, GLM_MODEL, GPT_MODEL]
 
 KEY_COOLDOWN = 60
 
@@ -59,6 +60,7 @@ STATS_FILE = "/tmp/gateway_stats.json" if os.path.exists("/tmp") else "gateway_s
 POOL_FILE = "/tmp/gateway_pool.json" if os.path.exists("/tmp") else "gateway_pool.json"
 
 DEBUG_MAX_TEXT_LEN = 20000
+DEBUG_CAPTURE_PAYLOADS = os.getenv("DEBUG_CAPTURE_PAYLOADS", "false").lower() == "true"
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
@@ -77,6 +79,12 @@ async_client = httpx.AsyncClient(
     limits=httpx.Limits(max_keepalive_connections=50, max_connections=200, keepalive_expiry=60.0),
     http2=True
 )
+
+groq_adapter = GroqAdapter(
+    redis_url=UPSTASH_REDIS_REST_URL,
+    redis_token=UPSTASH_REDIS_REST_TOKEN,
+)
+agnes_adapter = AgnesAdapter()
 
 async def upstash_get_async(key: str) -> Optional[Any]:
     if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
@@ -260,6 +268,10 @@ DEBUG_LOGS = deque(maxlen=50)
 debug_log_lock = asyncio.Lock()
 
 async def add_debug_log_async(data: dict):
+    if not DEBUG_CAPTURE_PAYLOADS:
+        data = dict(data)
+        data["request_body"] = "[payload capture disabled]"
+        data["response_body"] = "[payload capture disabled]"
     async with debug_log_lock:
         DEBUG_LOGS.appendleft(data)
     if UPSTASH_REDIS_REST_URL:
@@ -310,11 +322,13 @@ class AsyncKeyPool:
 
         for key in self.keys:
             self.data[key] = {}
+            stored_key = "sha256:" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+            stored_data = history_pool.get(stored_key, history_pool.get(key, {}))
             for model in CEREBRAS_MODELS:
-                h_req = history_pool.get(key, {}).get(model, {}).get("requests", 0)
-                h_tok = history_pool.get(key, {}).get(model, {}).get("tokens", 0)
-                h_tpd = history_pool.get(key, {}).get(model, {}).get("tpd_tokens", 0)
-                h_date = history_pool.get(key, {}).get(model, {}).get("last_reset_date", "")
+                h_req = stored_data.get(model, {}).get("requests", 0)
+                h_tok = stored_data.get(model, {}).get("tokens", 0)
+                h_tpd = stored_data.get(model, {}).get("tpd_tokens", 0)
+                h_date = stored_data.get(model, {}).get("last_reset_date", "")
 
                 if h_date != bj_now:
                     h_tpd = 0
@@ -345,9 +359,10 @@ class AsyncKeyPool:
             try:
                 export = {}
                 for k, v in self.data.items():
-                    export[k] = {}
+                    stored_key = "sha256:" + hashlib.sha256(k.encode("utf-8")).hexdigest()
+                    export[stored_key] = {}
                     for m, info in v.items():
-                        export[k][m] = {
+                        export[stored_key][m] = {
                             "requests": info["requests"],
                             "tokens": info["tokens"],
                             "tpd_tokens": info.get("tpd_tokens", 0),
@@ -582,15 +597,46 @@ async def authorize_model_request(
         return None, response
     return principal, None
 
-def admin_session_token() -> str:
+def create_admin_session_token() -> str:
     if not ADMIN_API_KEY:
         return ""
-    return hmac.new(ADMIN_API_KEY.encode("utf-8"), b"cpr-admin-session", hashlib.sha256).hexdigest()
+    issued_at = str(int(time.time()))
+    signature = hmac.new(
+        ADMIN_API_KEY.encode("utf-8"),
+        ("cpr-admin-session:" + issued_at).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return issued_at + "." + signature
 
 def is_admin_authenticated(request: Request) -> bool:
-    expected = admin_session_token()
     supplied = request.cookies.get("admin_session", "")
-    return bool(expected and supplied and hmac.compare_digest(expected, supplied))
+    issued_at, separator, signature = supplied.partition(".")
+    if not ADMIN_API_KEY or not separator or not issued_at.isdigit():
+        return False
+    if abs(int(time.time()) - int(issued_at)) > 86400:
+        return False
+    expected = hmac.new(
+        ADMIN_API_KEY.encode("utf-8"),
+        ("cpr-admin-session:" + issued_at).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+def admin_csrf_token(request: Request) -> str:
+    session = request.cookies.get("admin_session", "")
+    if not session or not ADMIN_API_KEY:
+        return ""
+    return hmac.new(
+        ADMIN_API_KEY.encode("utf-8"),
+        ("cpr-csrf:" + session).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+def admin_required_response() -> HTMLResponse:
+    return HTMLResponse(
+        content=html_page("Admin required", "<h2>需要管理员权限</h2><p>请先前往 <a href='/admin'>/admin</a> 登录。</p>"),
+        status_code=401,
+    )
 
 def get_thinking_display(body: dict) -> bool:
     if "thinkingdisplay" in body:
@@ -694,34 +740,20 @@ async def record_client_completion_async(principal: ClientPrincipal, model: str,
     )
 
 async def tracked_external_stream(source, principal: ClientPrincipal, model: str, body: dict):
-    usage = None
-    generated_text = ""
     try:
         async for chunk in source:
-            text = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else str(chunk)
-            for line in text.splitlines():
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if not payload or payload == "[DONE]":
-                    continue
-                try:
-                    data = json.loads(payload)
-                    if data.get("usage"):
-                        usage = data["usage"]
-                    for choice in data.get("choices", []):
-                        content = choice.get("delta", {}).get("content")
-                        if content:
-                            generated_text += content
-                except Exception:
-                    pass
             yield chunk
     finally:
+        await source.response.aclose()
+        usage = source.usage
         if not usage:
-            completion_tokens = estimate_tokens(text_content=generated_text)
+            completion_tokens = estimate_tokens(text_content=source.generated_text)
             usage = {"prompt_tokens": 0, "completion_tokens": completion_tokens, "total_tokens": completion_tokens}
-        await add_global_usage_async(model, usage)
-        await record_client_completion_async(principal, model, usage, body)
+        try:
+            await asyncio.wait_for(add_global_usage_async(model, usage), timeout=5.0)
+            await asyncio.wait_for(record_client_completion_async(principal, model, usage, body), timeout=5.0)
+        except Exception:
+            pass
 
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
@@ -735,8 +767,11 @@ async def chat(request: Request):
         raw = {}
 
     request_model = raw.get("model", DEFAULT_MODEL)
-    if request_model not in CEREBRAS_MODELS and request_model not in GROQ_MODELS and request_model not in AGNES_MODELS:
+    request_spec = get_model_spec(request_model)
+    if request_spec is None:
         return api_error(400, f"Unsupported model: {request_model}", "invalid_request_error", "unsupported_model", request_id)
+    if request_spec.operation != "chat":
+        return api_error(400, f"Use the {request_spec.operation} endpoint for this model", "invalid_request_error", "wrong_endpoint", request_id)
     principal, auth_error = await authorize_model_request(request, request_model, request_id, raw)
     if auth_error:
         return auth_error
@@ -749,79 +784,74 @@ async def chat(request: Request):
     show_thinking = final_thinking(raw)
 
     if request_model in AGNES_MODELS:
-        if request_model != AGNES_TEXT_MODEL:
-            return api_error(400, "Use the Agnes image or video endpoint for this model", "invalid_request_error", "wrong_endpoint", request_id)
-
-        agnes_resp, agnes_candidate, agnes_error = await execute_agnes_chat_request(async_client, raw, timeout=120.0)
-        if not agnes_resp or not agnes_candidate:
-            return api_error(503, agnes_error or "Agnes unavailable", "service_unavailable", "agnes_unavailable", request_id)
-        if not 200 <= agnes_resp.status_code < 300:
+        agnes_result = await agnes_adapter.chat(async_client, raw, timeout=120.0)
+        if not agnes_result.available:
+            return api_error(503, agnes_result.error or "Agnes unavailable", "service_unavailable", "agnes_unavailable", request_id)
+        if not 200 <= agnes_result.status_code < 300:
             try:
-                return upstream_response(agnes_resp)
+                return upstream_response(agnes_result.response)
             finally:
-                await agnes_resp.aclose()
+                await agnes_result.close()
 
         if raw.get("stream", False):
             async def agnes_stream_gen():
                 try:
-                    source = sanitize_agnes_sse_stream(agnes_resp, request_model, request_id)
+                    source = agnes_result.stream(request_id)
                     async for chunk in tracked_external_stream(source, principal, request_model, raw):
                         yield chunk
                 finally:
-                    await agnes_resp.aclose()
-                    await finish_log_async(request_id, request_model, agnes_candidate.key, f"agnes:{agnes_candidate.site}", False, start)
+                    await agnes_result.close()
+                    await finish_log_async(request_id, request_model, agnes_result.credential_suffix, f"agnes:{agnes_result.site}", False, start)
 
             return StreamingResponse(agnes_stream_gen(), media_type="text/event-stream")
 
         try:
-            result = sanitize_agnes_response(agnes_resp.json(), request_model, request_id)
+            result = agnes_result.json(request_id)
             usage = result.get("usage", {})
             await add_global_usage_async(request_model, usage)
             await record_client_completion_async(principal, request_model, usage, raw)
-            await finish_log_async(request_id, request_model, agnes_candidate.key, f"agnes:{agnes_candidate.site}", False, start, usage)
-            return JSONResponse(status_code=agnes_resp.status_code, content=result)
+            await finish_log_async(request_id, request_model, agnes_result.credential_suffix, f"agnes:{agnes_result.site}", False, start, usage)
+            return JSONResponse(status_code=agnes_result.status_code, content=result)
         finally:
-            await agnes_resp.aclose()
+            await agnes_result.close()
 
     if request_model in GROQ_MODELS:
-        groq_resp, groq_model, groq_key = await execute_groq_request(async_client, raw, show_thinking)
+        groq_result = await groq_adapter.chat(async_client, raw, show_thinking)
 
-        if groq_resp and groq_model and groq_key:
+        if groq_result.available:
             if raw.get("stream", False):
                 async def direct_groq_stream_gen():
                     try:
-                        source = sanitize_sse_stream(groq_resp, request_id=request_id, model=groq_model)
-                        async for chunk in tracked_external_stream(source, principal, groq_model, raw):
+                        source = groq_result.stream(request_id)
+                        async for chunk in tracked_external_stream(source, principal, groq_result.model, raw):
                             yield chunk
                     finally:
-                        await groq_resp.aclose()
-                        await groq_pool.record_success(groq_key, groq_model)
-                        await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
-                        await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", False, start)
+                        await groq_result.close()
+                        await groq_result.record_success()
+                        await finish_log_async(request_id, request_model, groq_result.credential_suffix, f"groq:{groq_result.model}", False, start)
 
                 return StreamingResponse(direct_groq_stream_gen(), media_type="text/event-stream")
 
             try:
-                res_data = sanitize_groq_response(groq_resp.json())
+                res_data = groq_result.json(request_id)
                 usage = res_data.get("usage", {})
                 total_tokens = usage.get("total_tokens", 0)
-                await add_global_usage_async(groq_model, usage)
-                await record_client_completion_async(principal, groq_model, usage, raw)
-                await groq_pool.record_success(groq_key, groq_model, total_tokens)
-                await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
-                await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", False, start, usage)
+                await add_global_usage_async(groq_result.model, usage)
+                await record_client_completion_async(principal, groq_result.model, usage, raw)
+                await groq_result.record_success(total_tokens)
+                await finish_log_async(request_id, request_model, groq_result.credential_suffix, f"groq:{groq_result.model}", False, start, usage)
 
                 bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
                 await add_debug_log_async({
                     "id": request_id, "time": bj_time, "request_model": request_model,
-                    "final_model": f"groq:{groq_model}", "key": groq_key[-4:], "status_code": 200,
+                    "final_model": f"groq:{groq_result.model}", "key": groq_result.credential_suffix, "status_code": 200,
                     "time_cost": round(time.time() - start, 2),
                     "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
                     "response_body": truncate_text(json.dumps(res_data, ensure_ascii=False, indent=2))
                 })
                 return JSONResponse(status_code=200, content=res_data)
             finally:
-                await groq_resp.aclose()
+                await groq_result.close()
 
         return JSONResponse(status_code=503, content={
             "error": {"message": "All Groq keys/models failed", "type": "service_unavailable", "param": None, "code": "groq_failed"},
@@ -853,6 +883,14 @@ async def chat(request: Request):
             tried_keys.add(selected_key)
             estimated_in = estimate_tokens(messages=raw.get("messages", []))
             body["model"] = selected_model
+            admitted = await admit_fixed_window(
+                async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN,
+                "cerebras", selected_key, selected_model,
+                pool.data[selected_key][selected_model]["limit_rpm"],
+            )
+            if admitted is False:
+                last_error = "Distributed upstream quota unavailable"
+                continue
             await pool.record_request_attempt_async(selected_key, selected_model, estimated_in)
 
             fallback_happened = (selected_model != request_model)
@@ -1045,7 +1083,7 @@ async def chat(request: Request):
 
     # 5. Cerebras 全部失败后，降级尝试 Groq
     allowed_groq_models = [model for model in GROQ_MODELS if access_manager.authorize(principal, model)]
-    groq_resp, groq_model, groq_key = (None, None, None)
+    groq_result = None
     if MODEL_FALLBACK_MODE == "auto":
         if allowed_groq_models and access_manager.provider_for_model(request_model) != "groq":
             fallback_quota = await access_manager.consume(
@@ -1059,11 +1097,11 @@ async def chat(request: Request):
         for fallback_model in allowed_groq_models:
             groq_raw = dict(raw)
             groq_raw["model"] = fallback_model
-            groq_resp, groq_model, groq_key = await execute_groq_request(async_client, groq_raw, show_thinking)
-            if groq_resp:
+            groq_result = await groq_adapter.chat(async_client, groq_raw, show_thinking)
+            if groq_result.available:
                 break
 
-    if groq_resp and groq_model and groq_key:
+    if groq_result and groq_result.available:
         async with stats_lock:
             GLOBAL_STATS["groq_fallback_count"] += 1
             GLOBAL_STATS["fallback_count"] += 1
@@ -1072,38 +1110,36 @@ async def chat(request: Request):
         if raw.get("stream", False):
             async def groq_stream_gen():
                 try:
-                    source = sanitize_sse_stream(groq_resp, request_id=request_id, model=groq_model)
-                    async for chunk in tracked_external_stream(source, principal, groq_model, raw):
+                    source = groq_result.stream(request_id)
+                    async for chunk in tracked_external_stream(source, principal, groq_result.model, raw):
                         yield chunk
                 finally:
-                    await groq_resp.aclose()
-                    await groq_pool.record_success(groq_key, groq_model)
-                    await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
-                    await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", True, start)
+                    await groq_result.close()
+                    await groq_result.record_success()
+                    await finish_log_async(request_id, request_model, groq_result.credential_suffix, f"groq:{groq_result.model}", True, start)
 
             return StreamingResponse(groq_stream_gen(), media_type="text/event-stream")
         else:
             try:
-                res_data = sanitize_groq_response(groq_resp.json())
+                res_data = groq_result.json(request_id)
                 usage = res_data.get("usage", {})
                 tot_tok = usage.get("total_tokens", 0)
-                await add_global_usage_async(groq_model, usage)
-                await record_client_completion_async(principal, groq_model, usage, raw)
-                await groq_pool.record_success(groq_key, groq_model, tot_tok)
-                await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
-                await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", True, start, usage)
+                await add_global_usage_async(groq_result.model, usage)
+                await record_client_completion_async(principal, groq_result.model, usage, raw)
+                await groq_result.record_success(tot_tok)
+                await finish_log_async(request_id, request_model, groq_result.credential_suffix, f"groq:{groq_result.model}", True, start, usage)
 
                 bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
                 await add_debug_log_async({
                     "id": request_id, "time": bj_time, "request_model": request_model,
-                    "final_model": f"groq:{groq_model}", "key": groq_key[-4:], "status_code": 200,
+                    "final_model": f"groq:{groq_result.model}", "key": groq_result.credential_suffix, "status_code": 200,
                     "time_cost": round(time.time() - start, 2),
                     "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
                     "response_body": truncate_text(json.dumps(res_data, ensure_ascii=False, indent=2))
                 })
                 return JSONResponse(status_code=200, content=res_data)
             finally:
-                await groq_resp.aclose()
+                await groq_result.close()
 
     # 6. 所有 Provider、模型、Key 均失败
     error_msg = f"All Cerebras and Groq keys/models failed. Last error: {last_error}"
@@ -1125,14 +1161,11 @@ def upstream_response(response: httpx.Response) -> Response:
     content_type = response.headers.get("content-type", "application/json").split(";", 1)[0]
     return Response(content=response.content, status_code=response.status_code, media_type=content_type)
 
-def agnes_media_response(response: httpx.Response, public_model: str) -> Response:
+def provider_json_response(result) -> Response:
     try:
-        data = response.json()
-        if isinstance(data, dict) and "model" in data:
-            data["model"] = public_model
-        return JSONResponse(content=data, status_code=response.status_code)
+        return JSONResponse(content=result.json(), status_code=result.status_code)
     except Exception:
-        return upstream_response(response)
+        return upstream_response(result.response)
 
 @app.post("/v1/images/generations")
 async def agnes_images(request: Request):
@@ -1149,21 +1182,21 @@ async def agnes_images(request: Request):
     if auth_error:
         return auth_error
 
-    response, candidate, error = await execute_agnes_request(
+    result = await agnes_adapter.request(
         async_client, "POST", "/images/generations", body=body,
         public_model=model, timeout=360.0,
     )
-    if response is None:
-        return api_error(503, error or "Agnes image service unavailable", "service_unavailable", "agnes_unavailable", request_id)
+    if not result.available:
+        return api_error(503, result.error or "Agnes image service unavailable", "service_unavailable", "agnes_unavailable", request_id)
     try:
-        if not 200 <= response.status_code < 300:
-            return upstream_response(response)
+        if not 200 <= result.status_code < 300:
+            return upstream_response(result.response)
         async with stats_lock:
             GLOBAL_STATS["agnes_requests"] = GLOBAL_STATS.get("agnes_requests", 0) + 1
         await save_global_stats_async()
-        return agnes_media_response(response, model)
+        return provider_json_response(result)
     finally:
-        await response.aclose()
+        await result.close()
 
 @app.post("/v1/videos")
 async def agnes_videos(request: Request):
@@ -1182,22 +1215,22 @@ async def agnes_videos(request: Request):
     if principal.is_open:
         return api_error(401, "Agnes video endpoints require a configured client key", "auth_error", "video_auth_required", request_id)
 
-    response, candidate, error = await execute_agnes_request(
+    result = await agnes_adapter.request(
         async_client, "POST", "/videos", body=body,
         public_model=model, timeout=120.0,
     )
-    if response is None:
-        return api_error(503, error or "Agnes video service unavailable", "service_unavailable", "agnes_unavailable", request_id)
+    if not result.available:
+        return api_error(503, result.error or "Agnes video service unavailable", "service_unavailable", "agnes_unavailable", request_id)
     try:
-        if not 200 <= response.status_code < 300:
-            return upstream_response(response)
+        if not 200 <= result.status_code < 300:
+            return upstream_response(result.response)
         try:
-            result_data = response.json()
+            result_data = result.json()
         except Exception:
             result_data = {}
         owner_data = {
             "client_id": principal.client_id,
-            "candidate_index": candidate.index,
+            "affinity_id": result.route_id,
         }
         task_identifiers = {
             str(value) for value in (
@@ -1209,9 +1242,9 @@ async def agnes_videos(request: Request):
         async with stats_lock:
             GLOBAL_STATS["agnes_requests"] = GLOBAL_STATS.get("agnes_requests", 0) + 1
         await save_global_stats_async()
-        return agnes_media_response(response, model)
+        return provider_json_response(result)
     finally:
-        await response.aclose()
+        await result.close()
 
 @app.get("/v1/videos/{task_id}")
 @app.get("/agnesapi")
@@ -1236,16 +1269,17 @@ async def agnes_video_result(request: Request, task_id: Optional[str] = None, vi
 
     query = dict(request.query_params)
     query.pop("video_id", None)
-    response, candidate, error = await query_agnes_video_result(
+    result = await agnes_adapter.query_video(
         async_client, lookup_id, query=query, timeout=60.0,
+        affinity_id=owner.get("affinity_id"),
         candidate_index=owner.get("candidate_index"),
     )
-    if response is None:
-        return api_error(503, error or "Agnes video result unavailable", "service_unavailable", "agnes_unavailable")
+    if not result.available:
+        return api_error(503, result.error or "Agnes video result unavailable", "service_unavailable", "agnes_unavailable")
     try:
-        return agnes_media_response(response, AGNES_VIDEO_MODEL)
+        return provider_json_response(result)
     finally:
-        await response.aclose()
+        await result.close()
 
 @app.get("/menu", response_class=HTMLResponse)
 @app.get("/", response_class=HTMLResponse)
@@ -1279,7 +1313,9 @@ Agnes ({len(AGNES_MODELS)}): {', '.join(AGNES_MODELS)}
     return HTMLResponse(content=html_page("Menu", body))
 
 @app.get("/status", response_class=HTMLResponse)
-async def status():
+async def status(request: Request):
+    if not is_admin_authenticated(request):
+        return admin_required_response()
     now = time.time()
     agnes_metrics = await get_agnes_metrics()
     
@@ -1462,7 +1498,9 @@ async def status():
     return HTMLResponse(content=html_page("Status 看板", html))
 
 @app.get("/log", response_class=HTMLResponse)
-async def log_page():
+async def log_page(request: Request):
+    if not is_admin_authenticated(request):
+        return admin_required_response()
     if UPSTASH_REDIS_REST_URL:
         async with log_lock:
             await load_log_deque_async(REQUEST_LOGS_KEY, REQUEST_LOGS)
@@ -1480,20 +1518,10 @@ async def log_page():
     """
     return HTMLResponse(content=html_page("Request Logs", html_body))
 
-@app.api_route("/debug", methods=["GET", "POST"], response_class=HTMLResponse)
-async def debug(request: Request, password: Optional[str] = Form(None), debug_auth_token: Optional[str] = Cookie(None)):
-    if CUSTOM_API_KEYS:
-        auth_token = debug_auth_token or password
-        valid_set = CUSTOM_API_KEYS | VALID_DEBUG_PASSWORDS
-        if not auth_token or auth_token not in valid_set:
-            login_form = """
-            <h2>🔒 Debug 面板访问受限</h2>
-            <form method="POST">
-                <input type="password" name="password" placeholder="请输入 Debug 访问密钥" style="padding:8px; border-radius:4px; border:1px solid #374151; background:#1f2937; color:#fff;"/>
-                <button type="submit" style="padding:8px 15px; background:#3b82f6; color:#fff; border:none; border-radius:4px; cursor:pointer;">登录</button>
-            </form>
-            """
-            return HTMLResponse(content=html_page("Debug 鉴权", login_form))
+@app.get("/debug", response_class=HTMLResponse)
+async def debug(request: Request):
+    if not is_admin_authenticated(request):
+        return admin_required_response()
 
     if UPSTASH_REDIS_REST_URL:
         async with debug_log_lock:
@@ -1556,13 +1584,12 @@ async def debug(request: Request, password: Optional[str] = Form(None), debug_au
     <hr style="border-color:#1e293b; margin-bottom:15px;"/>
     {content}
     """
-    resp = HTMLResponse(content=html_page("Debug 深度调试", body_html))
-    if CUSTOM_API_KEYS and password:
-        resp.set_cookie(key="debug_auth_token", value=password, max_age=86400*7)
-    return resp
+    return HTMLResponse(content=html_page("Debug 深度调试", body_html))
 
 @app.get("/config", response_class=HTMLResponse)
-async def config():
+async def config(request: Request):
+    if not is_admin_authenticated(request):
+        return admin_required_response()
     agnes_counts = get_agnes_counts()
     body = f"""<h2>⚙️ 系统当前全局运行配置</h2>
 <pre style='background:#1f2937; color:#f3f4f6; padding:15px; border-radius:6px; border:1px solid #374151;'>
@@ -1589,11 +1616,20 @@ async def admin_page(request: Request):
     form = await request.form() if request.method == "POST" else {}
 
     if request.method == "POST" and form.get("action") == "login":
+        client_ip = request.client.host if request.client else "unknown"
+        admitted = await admit_fixed_window(
+            async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN,
+            "admin", client_ip, "login", 10,
+        )
+        if admitted is False:
+            return HTMLResponse(content=html_page("Admin", "<h2>登录尝试过多</h2><p>请稍后再试。</p>"), status_code=429)
+        if admitted is None:
+            return HTMLResponse(content=html_page("Admin", "<h2>登录暂不可用</h2><p>无法校验登录限额。</p>"), status_code=503)
         supplied = str(form.get("admin_key", ""))
         if hmac.compare_digest(supplied, ADMIN_API_KEY):
             response = HTMLResponse(content=html_page("Admin", "<h2>登录成功</h2><p><a href='/admin'>进入管理页面</a></p>"))
             response.set_cookie(
-                "admin_session", admin_session_token(), max_age=86400,
+                "admin_session", create_admin_session_token(), max_age=86400,
                 httponly=True, secure=request.url.scheme == "https", samesite="strict",
             )
             return response
@@ -1612,8 +1648,12 @@ async def admin_page(request: Request):
 
     if request.method == "POST" and form.get("action") != "login":
         csrf = str(form.get("csrf", ""))
-        if not hmac.compare_digest(csrf, admin_session_token()):
+        if not hmac.compare_digest(csrf, admin_csrf_token(request)):
             return HTMLResponse(content=html_page("Admin", "<h2>请求已拒绝</h2><p>CSRF 校验失败。</p>"), status_code=403)
+        if form.get("action") == "logout":
+            response = HTMLResponse(content=html_page("Admin", "<h2>已退出</h2><p><a href='/admin'>重新登录</a></p>"))
+            response.delete_cookie("admin_session")
+            return response
         if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
             message = "未配置 Upstash，Admin 当前为只读模式"
         else:
@@ -1674,7 +1714,7 @@ async def admin_page(request: Request):
 
     clients = await access_manager.list_clients()
     rows = []
-    csrf = admin_session_token()
+    csrf = admin_csrf_token(request)
     for item in clients:
         models = ", ".join(item["allowed_models"] or ["全部允许范围内模型"])
         providers = item["providers"]
@@ -1697,6 +1737,7 @@ async def admin_page(request: Request):
     readonly = "<p style='color:#f59e0b;'>未配置 Upstash，动态配置不可写。</p>" if not UPSTASH_REDIS_REST_URL else ""
     body = f"""
     <h2>🔑 客户端 Key 管理</h2>
+    <form method="POST" style="float:right;"><input type="hidden" name="csrf" value="{csrf}"/><button name="action" value="logout" type="submit">退出登录</button></form>
     <p>{html_lib.escape(message)}</p>{generated_html}{readonly}
     <h3>创建 Key</h3>
     <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
@@ -1715,43 +1756,76 @@ async def admin_page(request: Request):
     </table></div>"""
     return HTMLResponse(content=html_page("Admin", body))
 
-@app.get("/thinkingdisplay", response_class=HTMLResponse)
-async def thinkingdisplay_page(mode: Optional[str] = None):
+@app.api_route("/thinkingdisplay", methods=["GET", "POST"], response_class=HTMLResponse)
+async def thinkingdisplay_page(request: Request):
     global THINKING_MODE
+    if not is_admin_authenticated(request):
+        return admin_required_response()
     await refresh_runtime_config_async()
     saved = None
-    if mode in ["auto", "on", "off"]:
-        THINKING_MODE = mode
-        saved = await save_runtime_config_async() if UPSTASH_REDIS_REST_URL else False
+    if request.method == "POST":
+        form = await request.form()
+        if not hmac.compare_digest(str(form.get("csrf", "")), admin_csrf_token(request)):
+            return HTMLResponse(content=html_page("Thinking Control", "<h2>CSRF 校验失败</h2>"), status_code=403)
+        mode = str(form.get("mode", ""))
+        if mode in ["auto", "on", "off"]:
+            if UPSTASH_REDIS_REST_URL:
+                saved = await upstash_set_async(RUNTIME_CONFIG_KEY, {
+                    "thinking_mode": mode,
+                    "fallback_mode": MODEL_FALLBACK_MODE,
+                })
+                if saved:
+                    THINKING_MODE = mode
+            else:
+                THINKING_MODE = mode
+                saved = False
     
     body = f"""<h2>🎯 思考输出渲染控制面</h2>
 <p>当前强制策略状态: <strong style="color:#3b82f6;">{THINKING_MODE.upper()}</strong></p>
 <p class="tag">{'设置已保存到 Upstash，可跨实例保持。' if saved else ('未配置 Upstash，设置仅当前实例有效。' if not UPSTASH_REDIS_REST_URL else ('设置保存失败。' if saved is False else '设置由 Upstash 跨实例同步。'))}</p>
 <hr style="border-color:#1e293b;"/>
-<ul style="list-style:none; padding:0;">
-    <li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=auto" style="display:block; padding:10px; background:#1f2937; border-radius:6px; border:1px solid #374151;">🔄 切换至 AUTO</a></li>
-    <li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=on" style="display:block; padding:10px; background:#065f46; color:#34d399; border-radius:6px;">🟢 切换至 ON</a></li>
-    <li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=off" style="display:block; padding:10px; background:#991b1b; color:#f87171; border-radius:6px;">🔴 切换至 OFF (游戏推荐)</a></li>
-</ul>"""
+<form method="POST" style="display:grid;gap:10px;">
+    <input type="hidden" name="csrf" value="{admin_csrf_token(request)}"/>
+    <button name="mode" value="auto" type="submit">切换至 AUTO</button>
+    <button name="mode" value="on" type="submit">切换至 ON</button>
+    <button name="mode" value="off" type="submit">切换至 OFF</button>
+</form>"""
     return HTMLResponse(content=html_page("Thinking Control", body))
 
-@app.get("/fallbackmode", response_class=HTMLResponse)
-async def fallbackmode_page(mode: Optional[str] = None):
+@app.api_route("/fallbackmode", methods=["GET", "POST"], response_class=HTMLResponse)
+async def fallbackmode_page(request: Request):
     global MODEL_FALLBACK_MODE
+    if not is_admin_authenticated(request):
+        return admin_required_response()
     await refresh_runtime_config_async()
     saved = None
-    if mode in ["auto", "off", "force_gpt"]:
-        MODEL_FALLBACK_MODE = mode
-        saved = await save_runtime_config_async() if UPSTASH_REDIS_REST_URL else False
+    if request.method == "POST":
+        form = await request.form()
+        if not hmac.compare_digest(str(form.get("csrf", "")), admin_csrf_token(request)):
+            return HTMLResponse(content=html_page("Fallback Control", "<h2>CSRF 校验失败</h2>"), status_code=403)
+        mode = str(form.get("mode", ""))
+        if mode in ["auto", "off", "force_gpt"]:
+            if UPSTASH_REDIS_REST_URL:
+                saved = await upstash_set_async(RUNTIME_CONFIG_KEY, {
+                    "thinking_mode": THINKING_MODE,
+                    "fallback_mode": mode,
+                })
+                if saved:
+                    MODEL_FALLBACK_MODE = mode
+            else:
+                MODEL_FALLBACK_MODE = mode
+                saved = False
     
     body = f"""<h2>🔀 模型降级策略控制面</h2>
 <p>当前策略状态: <strong style="color:#eab308;">{MODEL_FALLBACK_MODE.upper()}</strong></p>
 <p class="tag">{'设置已保存到 Upstash，可跨实例保持。' if saved else ('未配置 Upstash，设置仅当前实例有效。' if not UPSTASH_REDIS_REST_URL else ('设置保存失败。' if saved is False else '设置由 Upstash 跨实例同步。'))}</p>
 <hr style="border-color:#1e293b;"/>
-<ul style="list-style:none; padding:0;">
-    <li style="margin-bottom:10px;"><a href="/fallbackmode?mode=auto" style="display:block; padding:10px; background:#1f2937; border-radius:6px; border:1px solid #374151;">🔄 切换至 AUTO (多级降级)</a></li>
-    <li style="margin-bottom:10px;"><a href="/fallbackmode?mode=off" style="display:block; padding:10px; background:#991b1b; color:#f87171; border-radius:6px;">🔴 切换至 OFF (禁止降级)</a></li>
-</ul>"""
+<form method="POST" style="display:grid;gap:10px;">
+    <input type="hidden" name="csrf" value="{admin_csrf_token(request)}"/>
+    <button name="mode" value="auto" type="submit">切换至 AUTO</button>
+    <button name="mode" value="off" type="submit">切换至 OFF</button>
+    <button name="mode" value="force_gpt" type="submit">切换至 FORCE_GPT</button>
+</form>"""
     return HTMLResponse(content=html_page("Fallback Control", body))
 
 @app.get("/v1/models")
@@ -1760,14 +1834,8 @@ async def models(request: Request):
     if principal is None:
         return api_error(401, "Unauthorized", "auth_error", "unauthorized")
     models_list = [
-        {"id": m, "object": "model", "created": 1700000000, "owned_by": "cerebras"}
-        for m in CEREBRAS_MODELS
-    ] + [
-        {"id": m, "object": "model", "created": 1700000000, "owned_by": "groq"}
-        for m in GROQ_MODELS
-    ] + [
-        {"id": m, "object": "model", "created": 1700000000, "owned_by": "agnes"}
-        for m in AGNES_MODELS
+        {"id": spec.public_id, "object": "model", "created": 1700000000, "owned_by": spec.provider}
+        for spec in MODEL_CATALOG.values()
     ]
     models_list = [item for item in models_list if access_manager.authorize(principal, item["id"])]
     return JSONResponse(content={"object": "list", "data": models_list})

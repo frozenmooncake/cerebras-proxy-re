@@ -1,4 +1,5 @@
 import os
+import hashlib
 import json
 import time
 from collections import deque
@@ -6,19 +7,18 @@ from datetime import datetime, timezone, timedelta
 from typing import Tuple, Optional, Any, List, AsyncGenerator
 import httpx
 
+try:
+    from .model_catalog import GROQ_MODELS
+    from .distributed_limits import admit_fixed_window
+except ImportError:
+    from model_catalog import GROQ_MODELS
+    from distributed_limits import admit_fixed_window
+
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
-# Groq 官方托管模型全局汇总 (已按最新列表更新)
-GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "openai/gpt-oss-safeguard-20b",
-    "qwen/qwen3.6-27b"
-]
-
 GROQ_API_KEYS = list(filter(None, os.getenv("GROQ_API_KEYS", "").split(",")))
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 KEY_COOLDOWN = 60
 
 STANDARD_FINISH_REASONS = {"stop", "length", "tool_calls", "content_filter"}
@@ -44,11 +44,13 @@ class AsyncGroqKeyPool:
 
         for key in self.keys:
             self.data[key] = {}
+            stored_key = "sha256:" + hashlib.sha256(key.encode("utf-8")).hexdigest()
+            stored_data = history_pool.get(stored_key, history_pool.get(key, {}))
             for model in GROQ_MODELS:
-                h_req = history_pool.get(key, {}).get(model, {}).get("requests", 0)
-                h_tok = history_pool.get(key, {}).get(model, {}).get("tokens", 0)
-                h_tpd = history_pool.get(key, {}).get(model, {}).get("tpd_tokens", 0)
-                h_date = history_pool.get(key, {}).get(model, {}).get("last_reset_date", "")
+                h_req = stored_data.get(model, {}).get("requests", 0)
+                h_tok = stored_data.get(model, {}).get("tokens", 0)
+                h_tpd = stored_data.get(model, {}).get("tpd_tokens", 0)
+                h_date = stored_data.get(model, {}).get("last_reset_date", "")
 
                 if h_date != bj_now:
                     h_tpd = 0
@@ -78,9 +80,10 @@ class AsyncGroqKeyPool:
         try:
             export = {}
             for k, v in self.data.items():
-                export[k] = {}
+                stored_key = "sha256:" + hashlib.sha256(k.encode("utf-8")).hexdigest()
+                export[stored_key] = {}
                 for m, info in v.items():
-                    export[k][m] = {
+                    export[stored_key][m] = {
                         "requests": info["requests"],
                         "tokens": info["tokens"],
                         "tpd_tokens": info.get("tpd_tokens", 0),
@@ -314,6 +317,13 @@ async def execute_groq_request(
 
             tried_keys.add(key)
             groq_body = sanitize_groq_body(raw_body, show_thinking, target_model)
+            limit_rpm = groq_pool.data.get(key, {}).get(target_model, {}).get("limit_rpm", 30)
+            admitted = await admit_fixed_window(
+                client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN,
+                "groq", key, target_model, limit_rpm,
+            )
+            if admitted is False:
+                continue
             groq_pool.record_request_attempt(key, target_model)
 
             try:

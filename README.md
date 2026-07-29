@@ -1,4 +1,4 @@
-# Cerebras OpenAI API Gateway 2.0.7
+# Cerebras OpenAI API Gateway 2.1.0
 
 > 聚合 Cerebras、Groq 和 Agnes 的 OpenAI 兼容网关，支持多 Key 轮询、模型权限和贡献额度管理。
 
@@ -25,6 +25,10 @@
 - **OpenCode / Cursor 兼容**：补齐 OpenAI 标准模型列表与流式字段，便于编辑器直接识别并接入。
 - **云端/本地双模持久化**：原生支持 Upstash Redis 异步持久化存储统计与 Key 池状态；无 Redis 时自动平滑回退至本地 JSON 文件存储。
 - **日志与控制状态持久化**：配置 Upstash 后，最近 100 条请求日志、最近 50 条 Debug 日志以及 Thinking/Fallback 模式会跨 Vercel 实例同步并在冷启动后恢复。
+- **统一模型目录与 Provider Adapter**：模型归属、操作类型和基础额度集中管理；Groq/Agnes 的响应、流式标准化和资源关闭由统一 adapter 负责。
+- **分布式上游保护**：配置 Upstash 后，Cerebras、Groq 和 Agnes 的物理上游 RPM admission 在 Vercel 多实例间共享。
+- **管理面安全**：状态、日志、Debug、配置和控制页面仅允许 Admin 会话访问；控制修改使用 POST + CSRF，Admin 会话带 24 小时签名有效期。
+- **测试基线**：使用标准库 `unittest` 覆盖鉴权、模型目录、共享额度、管理页面、Provider adapter、视频 affinity 和 Redis 限额。
 
 ---
 
@@ -71,6 +75,7 @@
 | `UPSTASH_REDIS_REST_TOKEN` | 否 | - | Upstash Redis REST Token |
 | `THINKING_MODE` | 否 | `auto` | 思考模式强控：`auto` / `on` / `off` |
 | `MODEL_FALLBACK_MODE` | 否 | `auto` | 自动降级模式：`auto` / `off` / `force_gpt` |
+| `DEBUG_CAPTURE_PAYLOADS` | 否 | `false` | 是否在 Debug 日志中保存完整请求和响应正文；生产环境建议保持关闭 |
 
 结构化客户端 Key 示例：
 
@@ -220,6 +225,37 @@ export default {
   - `agnes/agnes-video-v2.0`
 
 Agnes 付费模型 `agnes-2.5-pro-alpha` 未纳入托管列表。
+
+---
+
+## 测试
+
+项目测试不依赖额外测试框架：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+静态编译检查：
+
+```bash
+python -m py_compile api/main.py api/model_catalog.py api/provider_adapters.py api/distributed_limits.py api/access_control.py api/agnes_provider.py api/groq_provider.py
+```
+
+### 管理页面安全
+
+以下页面需要先在 `/admin` 使用 `ADMIN_API_KEY` 登录：
+
+```text
+/status
+/log
+/debug
+/config
+/thinkingdisplay
+/fallbackmode
+```
+
+Thinking 和 Fallback 修改已改为 POST 操作，并校验绑定当前 Admin 会话的 CSRF token。`/debug` 默认只保存元数据；仅在受控诊断期间设置 `DEBUG_CAPTURE_PAYLOADS=true`。
 
 ---
 

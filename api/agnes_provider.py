@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import json
 import os
 import time
@@ -9,11 +10,12 @@ from typing import Any, AsyncGenerator, Deque, Dict, List, Optional, Set, Tuple
 
 import httpx
 
-
-AGNES_TEXT_MODEL = "agnes/agnes-2.5-flash"
-AGNES_IMAGE_MODEL = "agnes/agnes-image-2.1-flash"
-AGNES_VIDEO_MODEL = "agnes/agnes-video-v2.0"
-AGNES_MODELS = [AGNES_TEXT_MODEL, AGNES_IMAGE_MODEL, AGNES_VIDEO_MODEL]
+try:
+    from .model_catalog import AGNES_IMAGE_MODEL, AGNES_MODELS, AGNES_TEXT_MODEL, AGNES_VIDEO_MODEL
+    from .distributed_limits import admit_fixed_window
+except ImportError:
+    from model_catalog import AGNES_IMAGE_MODEL, AGNES_MODELS, AGNES_TEXT_MODEL, AGNES_VIDEO_MODEL
+    from distributed_limits import admit_fixed_window
 
 AGNES_CN_BASE_URL = "https://api.agnes-ai.cn/v1"
 AGNES_INTL_BASE_URL = "https://apihub.agnes-ai.com/v1"
@@ -34,6 +36,8 @@ def _env_keys(name: str) -> List[str]:
 
 AGNES_CN_API_KEYS = _env_keys("AGNES_CN_API_KEYS")
 AGNES_INTL_API_KEYS = _env_keys("AGNES_INTL_API_KEYS")
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 
 
 @dataclass(frozen=True)
@@ -46,6 +50,11 @@ class AgnesCandidate:
     @property
     def root_url(self) -> str:
         return self.base_url.removesuffix("/v1")
+
+    @property
+    def affinity_id(self) -> str:
+        value = f"{self.site}\0{self.key}".encode("utf-8")
+        return f"{self.site}:{hashlib.sha256(value).hexdigest()[:16]}"
 
 
 def _rate_bucket(public_model: str, body: Optional[Dict[str, Any]]) -> Tuple[str, int]:
@@ -230,6 +239,14 @@ async def execute_agnes_request(
             break
         last_candidate = candidate
         tried.add(candidate.index)
+        bucket_name, limit_rpm = _rate_bucket(public_model, body)
+        admitted = await admit_fixed_window(
+            client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN,
+            "agnes", candidate.site, bucket_name, limit_rpm,
+        )
+        if admitted is False:
+            last_error = f"{candidate.site} distributed quota unavailable"
+            continue
         try:
             request = client.build_request(
                 method.upper(),
@@ -358,6 +375,7 @@ async def query_agnes_video_result(
     query: Optional[Dict[str, Any]] = None,
     timeout: Any = 60.0,
     allow_legacy: bool = True,
+    affinity_id: Optional[str] = None,
     candidate_index: Optional[int] = None,
 ) -> Tuple[Optional[httpx.Response], Optional[AgnesCandidate], Optional[str]]:
     if not agnes_pool.candidates:
@@ -366,7 +384,10 @@ async def query_agnes_video_result(
     params.setdefault("video_id", task_id)
     candidates = [
         candidate for candidate in agnes_pool.candidates
-        if candidate_index is None or candidate.index == candidate_index
+        if (
+            (affinity_id is None or candidate.affinity_id == affinity_id)
+            and (candidate_index is None or candidate.index == candidate_index)
+        )
     ]
     routes = [(candidate, f"{candidate.root_url}/agnesapi", params) for candidate in candidates]
     if allow_legacy:
