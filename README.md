@@ -1,4 +1,4 @@
-# Cerebras OpenAI API Gateway 2.0.6
+# Cerebras OpenAI API Gateway 2.0.7
 
 > 聚合 Cerebras、Groq 和 Agnes 的 OpenAI 兼容网关，支持多 Key 轮询、模型权限和贡献额度管理。
 
@@ -24,6 +24,7 @@
 - **可视化监控与深度调试**：提供极简黑夜风格看板，实时查看所有 Key 的 RPM/RPD/TPM/TPD 水位线、最近 100 条请求历史，以及支持同时打包 Request 与 Response 的一键调试包复制。
 - **OpenCode / Cursor 兼容**：补齐 OpenAI 标准模型列表与流式字段，便于编辑器直接识别并接入。
 - **云端/本地双模持久化**：原生支持 Upstash Redis 异步持久化存储统计与 Key 池状态；无 Redis 时自动平滑回退至本地 JSON 文件存储。
+- **日志与控制状态持久化**：配置 Upstash 后，最近 100 条请求日志、最近 50 条 Debug 日志以及 Thinking/Fallback 模式会跨 Vercel 实例同步并在冷启动后恢复。
 
 ---
 
@@ -102,6 +103,8 @@
 ```
 
 `providers` 中的数量同时表示服务商访问权限和贡献数量。`0` 表示禁止访问该服务商。服务端实际额度始终读取配置内容，不信任 Key 名称中的数字。Admin 页面生成的动态 Key 需要 Upstash 持久化；未配置 Upstash 时 Admin 为只读模式。
+
+Vercel Serverless 的内存和临时文件不会跨实例长期保留。若需要 `/log`、`/debug`、`/thinkingdisplay`、`/fallbackmode` 在刷新、冷启动和重新部署后保持状态，必须同时配置 `UPSTASH_REDIS_REST_URL` 与 `UPSTASH_REDIS_REST_TOKEN`。
 
 例如贡献者 A 提供了 2 个 Cerebras Key 和 1 个 Groq Key，则配置为 `cerebras: 2`、`groq: 1`、`agnes: 0`。该客户端 Key 可以调用 Cerebras 和 Groq，但 `/v1/models` 不会返回 Agnes 模型，直接请求 Agnes 也会返回 `403 model_not_allowed`。
 

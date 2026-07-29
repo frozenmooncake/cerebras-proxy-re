@@ -40,7 +40,7 @@ from agnes_provider import (
 )
 from access_control import ClientPrincipal, access_manager
 
-VERSION = "2.0.6-FastAPI"
+VERSION = "2.0.7-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 GEMMA_MODEL = "gemma-4-31b"
@@ -114,6 +114,74 @@ async def upstash_set_async(key: str, value: Any) -> bool:
     except Exception:
         return False
 
+async def upstash_pipeline_async(commands: list) -> Optional[list]:
+    if not UPSTASH_REDIS_REST_URL or not UPSTASH_REDIS_REST_TOKEN:
+        return None
+    try:
+        response = await async_client.post(
+            f"{UPSTASH_REDIS_REST_URL}/pipeline",
+            headers={"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"},
+            json=commands,
+            timeout=5.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return [item.get("result") if isinstance(item, dict) else item for item in data]
+    except Exception:
+        return None
+
+RUNTIME_CONFIG_KEY = "gateway_runtime_config"
+REQUEST_LOGS_KEY = "gateway_request_logs_v2"
+DEBUG_LOGS_KEY = "gateway_debug_logs_v2"
+runtime_config_lock = asyncio.Lock()
+runtime_config_last_refresh = 0.0
+
+async def refresh_runtime_config_async(force: bool = False):
+    global THINKING_MODE, MODEL_FALLBACK_MODE, runtime_config_last_refresh
+    if not UPSTASH_REDIS_REST_URL:
+        return
+    now = time.monotonic()
+    async with runtime_config_lock:
+        if not force and now - runtime_config_last_refresh < 5.0:
+            return
+        runtime_config_last_refresh = now
+    stored = await upstash_get_async(RUNTIME_CONFIG_KEY)
+    if not isinstance(stored, dict):
+        return
+    thinking = str(stored.get("thinking_mode", "")).lower()
+    fallback = str(stored.get("fallback_mode", "")).lower()
+    if thinking in {"auto", "on", "off"}:
+        THINKING_MODE = thinking
+    if fallback in {"auto", "off", "force_gpt"}:
+        MODEL_FALLBACK_MODE = fallback
+
+async def save_runtime_config_async() -> bool:
+    return await upstash_set_async(RUNTIME_CONFIG_KEY, {
+        "thinking_mode": THINKING_MODE,
+        "fallback_mode": MODEL_FALLBACK_MODE,
+    })
+
+async def load_log_deque_async(redis_key: str, target: deque):
+    results = await upstash_pipeline_async([["LRANGE", redis_key, 0, target.maxlen - 1]])
+    if not results or not isinstance(results[0], list):
+        return
+    loaded = []
+    for value in results[0]:
+        try:
+            item = json.loads(value)
+            if isinstance(item, dict):
+                loaded.append(item)
+        except Exception:
+            pass
+    target.clear()
+    target.extend(loaded)
+
+async def persist_log_async(redis_key: str, data: dict, maxlen: int):
+    await upstash_pipeline_async([
+        ["LPUSH", redis_key, json.dumps(data, ensure_ascii=False)],
+        ["LTRIM", redis_key, 0, maxlen - 1],
+    ])
+
 stats_lock = asyncio.Lock()
 
 def get_default_stats():
@@ -163,6 +231,8 @@ video_task_lock = asyncio.Lock()
 async def add_log_async(data: dict):
     async with log_lock:
         REQUEST_LOGS.appendleft(data)
+    if UPSTASH_REDIS_REST_URL:
+        await persist_log_async(REQUEST_LOGS_KEY, data, REQUEST_LOGS.maxlen)
 
 def video_owner_key(task_id: str) -> str:
     digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
@@ -192,6 +262,8 @@ debug_log_lock = asyncio.Lock()
 async def add_debug_log_async(data: dict):
     async with debug_log_lock:
         DEBUG_LOGS.appendleft(data)
+    if UPSTASH_REDIS_REST_URL:
+        await persist_log_async(DEBUG_LOGS_KEY, data, DEBUG_LOGS.maxlen)
 
 def truncate_text(text: str, max_len: int = DEBUG_MAX_TEXT_LEN) -> str:
     if isinstance(text, str) and len(text) > max_len:
@@ -404,6 +476,9 @@ async def lifespan(app: FastAPI):
     await pool.init_pool_data()
     await groq_pool.restore_from_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
     await access_manager.initialize(upstash_get_strict_async)
+    await refresh_runtime_config_async(force=True)
+    await load_log_deque_async(REQUEST_LOGS_KEY, REQUEST_LOGS)
+    await load_log_deque_async(DEBUG_LOGS_KEY, DEBUG_LOGS)
     yield
     await async_client.aclose()
 
@@ -669,6 +744,7 @@ async def chat(request: Request):
     async with stats_lock:
         GLOBAL_STATS["total_requests"] += 1
     await save_global_stats_async()
+    await refresh_runtime_config_async()
 
     show_thinking = final_thinking(raw)
 
@@ -1174,6 +1250,7 @@ async def agnes_video_result(request: Request, task_id: Optional[str] = None, vi
 @app.get("/menu", response_class=HTMLResponse)
 @app.get("/", response_class=HTMLResponse)
 async def menu():
+    await refresh_runtime_config_async()
     body = f"""<h2>🧠 Cerebras OpenAI Gateway Menu</h2>
 <p><strong>Version:</strong> {VERSION}</p>
 <p style="color: #9ca3af; font-size: 14px; margin-top: -10px;">作者：速冻月饼 | 🔗 <a href="https://github.com/xyrct301/cerebras-proxy-re" target="_blank">GitHub 开源仓库</a></p>
@@ -1386,6 +1463,9 @@ async def status():
 
 @app.get("/log", response_class=HTMLResponse)
 async def log_page():
+    if UPSTASH_REDIS_REST_URL:
+        async with log_lock:
+            await load_log_deque_async(REQUEST_LOGS_KEY, REQUEST_LOGS)
     lines = ["="*50, "📜 历史回溯请求日志 (最近100条)", "="*50]
     async with log_lock:
         for x in REQUEST_LOGS:
@@ -1414,6 +1494,10 @@ async def debug(request: Request, password: Optional[str] = Form(None), debug_au
             </form>
             """
             return HTMLResponse(content=html_page("Debug 鉴权", login_form))
+
+    if UPSTASH_REDIS_REST_URL:
+        async with debug_log_lock:
+            await load_log_deque_async(DEBUG_LOGS_KEY, DEBUG_LOGS)
 
     copy_script = """
     <script>
@@ -1634,11 +1718,15 @@ async def admin_page(request: Request):
 @app.get("/thinkingdisplay", response_class=HTMLResponse)
 async def thinkingdisplay_page(mode: Optional[str] = None):
     global THINKING_MODE
+    await refresh_runtime_config_async()
+    saved = None
     if mode in ["auto", "on", "off"]:
         THINKING_MODE = mode
+        saved = await save_runtime_config_async() if UPSTASH_REDIS_REST_URL else False
     
     body = f"""<h2>🎯 思考输出渲染控制面</h2>
 <p>当前强制策略状态: <strong style="color:#3b82f6;">{THINKING_MODE.upper()}</strong></p>
+<p class="tag">{'设置已保存到 Upstash，可跨实例保持。' if saved else ('未配置 Upstash，设置仅当前实例有效。' if not UPSTASH_REDIS_REST_URL else ('设置保存失败。' if saved is False else '设置由 Upstash 跨实例同步。'))}</p>
 <hr style="border-color:#1e293b;"/>
 <ul style="list-style:none; padding:0;">
     <li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=auto" style="display:block; padding:10px; background:#1f2937; border-radius:6px; border:1px solid #374151;">🔄 切换至 AUTO</a></li>
@@ -1650,11 +1738,15 @@ async def thinkingdisplay_page(mode: Optional[str] = None):
 @app.get("/fallbackmode", response_class=HTMLResponse)
 async def fallbackmode_page(mode: Optional[str] = None):
     global MODEL_FALLBACK_MODE
+    await refresh_runtime_config_async()
+    saved = None
     if mode in ["auto", "off", "force_gpt"]:
         MODEL_FALLBACK_MODE = mode
+        saved = await save_runtime_config_async() if UPSTASH_REDIS_REST_URL else False
     
     body = f"""<h2>🔀 模型降级策略控制面</h2>
 <p>当前策略状态: <strong style="color:#eab308;">{MODEL_FALLBACK_MODE.upper()}</strong></p>
+<p class="tag">{'设置已保存到 Upstash，可跨实例保持。' if saved else ('未配置 Upstash，设置仅当前实例有效。' if not UPSTASH_REDIS_REST_URL else ('设置保存失败。' if saved is False else '设置由 Upstash 跨实例同步。'))}</p>
 <hr style="border-color:#1e293b;"/>
 <ul style="list-style:none; padding:0;">
     <li style="margin-bottom:10px;"><a href="/fallbackmode?mode=auto" style="display:block; padding:10px; background:#1f2937; border-radius:6px; border:1px solid #374151;">🔄 切换至 AUTO (多级降级)</a></li>
