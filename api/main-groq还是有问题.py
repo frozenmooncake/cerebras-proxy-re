@@ -6,23 +6,26 @@ import asyncio
 import tiktoken
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any
+from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Response, Form, Cookie
+from fastapi import FastAPI, Request, Response, HTTPException, Depends, Form, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from dotenv import load_dotenv
 
-load_dotenv()
+from groq_provider import execute_groq_request, sanitize_sse_stream, GROQ_MODELS, groq_pool
 
-VERSION = "2.0.4-OpenCode"
-
+VERSION = "2.0.3-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
-DEFAULT_MODEL = "gpt-oss-120b"
+
+GEMMA_MODEL = "gemma-4-31b"
 GLM_MODEL = "zai-glm-4.7"
 GPT_MODEL = "gpt-oss-120b"
+
+DEFAULT_MODEL = GPT_MODEL
+CEREBRAS_MODELS = [GEMMA_MODEL, GLM_MODEL, GPT_MODEL]
+
 KEY_COOLDOWN = 60
 
 THINKING_MODE = os.getenv("THINKING_MODE", "auto").lower()
@@ -30,6 +33,7 @@ MODEL_FALLBACK_MODE = os.getenv("MODEL_FALLBACK_MODE", "auto").lower()
 
 STATS_FILE = "/tmp/gateway_stats.json" if os.path.exists("/tmp") else "gateway_stats.json"
 POOL_FILE = "/tmp/gateway_pool.json" if os.path.exists("/tmp") else "gateway_pool.json"
+
 DEBUG_MAX_TEXT_LEN = 20000
 
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
@@ -79,15 +83,13 @@ stats_lock = asyncio.Lock()
 
 def get_default_stats():
     return {
-        "total_requests": 0,
-        "fallback_count": 0,
-        "429_count": 0,
-        "truncated_count": 0,
-        "other_models_count": 0,
-        "models": {
-            GLM_MODEL: {"requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0},
-            GPT_MODEL: {"requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0}
-        }
+        "total_requests": 0,       
+        "fallback_count": 0,       
+        "groq_fallback_count": 0,
+        "429_count": 0,            
+        "truncated_count": 0,      
+        "other_models_count": 0,    
+        "models": {m: {"requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0} for m in CEREBRAS_MODELS + GROQ_MODELS}
     }
 
 GLOBAL_STATS = get_default_stats()
@@ -95,15 +97,15 @@ GLOBAL_STATS = get_default_stats()
 async def init_global_stats():
     global GLOBAL_STATS
     up_stats = await upstash_get_async("gateway_stats")
-    if up_stats and "models" in up_stats and GLM_MODEL in up_stats["models"]:
-        GLOBAL_STATS = up_stats
+    if up_stats and "models" in up_stats:
+        GLOBAL_STATS.update(up_stats)
         return
     if os.path.exists(STATS_FILE):
         try:
             with open(STATS_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
-                if "models" in saved and GLM_MODEL in saved["models"]:
-                    GLOBAL_STATS = saved
+                if "models" in saved:
+                    GLOBAL_STATS.update(saved)
         except Exception:
             pass
 
@@ -141,14 +143,14 @@ def estimate_tokens(messages: list = None, text_content: str = "") -> int:
         encoding = tiktoken.get_encoding("cl100k_base")
     except Exception:
         encoding = tiktoken.get_encoding("gpt-4")
+    
     if messages:
         num_tokens = 0
         for message in messages:
             num_tokens += 4
-            if isinstance(message, dict):
-                for key, value in message.items():
-                    if isinstance(value, str):
-                        num_tokens += len(encoding.encode(value))
+            for key, value in message.items():
+                if isinstance(value, str):
+                    num_tokens += len(encoding.encode(value))
         num_tokens += 2
         return num_tokens
     if text_content:
@@ -171,29 +173,33 @@ class AsyncKeyPool:
                     history_pool = json.load(f)
             except Exception:
                 pass
+
         bj_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
         for key in self.keys:
             self.data[key] = {}
-            for model in [GLM_MODEL, GPT_MODEL]:
+            for model in CEREBRAS_MODELS:
                 h_req = history_pool.get(key, {}).get(model, {}).get("requests", 0)
                 h_tok = history_pool.get(key, {}).get(model, {}).get("tokens", 0)
                 h_tpd = history_pool.get(key, {}).get(model, {}).get("tpd_tokens", 0)
                 h_date = history_pool.get(key, {}).get(model, {}).get("last_reset_date", "")
+
                 if h_date != bj_now:
                     h_tpd = 0
                     h_date = bj_now
+                
                 self.data[key][model] = {
                     "cooldown": 0,
                     "requests": h_req,
-                    "tokens": h_tok,
-                    "tpd_tokens": h_tpd,
-                    "last_reset_date": h_date,
+                    "tokens": h_tok,             
+                    "tpd_tokens": h_tpd,         
+                    "last_reset_date": h_date,   
                     "req_timestamps": deque(),
                     "token_timestamps": deque(),
-                    "limit_rpm": 60,
-                    "limit_rpd": 1000,
-                    "limit_tpm": 6000000,
-                    "limit_tpd": 6000000,
+                    "limit_rpm": 5,
+                    "limit_rpd": 2400,
+                    "limit_tpm": 30000,
+                    "limit_tpd": 1000000,
                     "has_synced": False
                 }
 
@@ -201,6 +207,7 @@ class AsyncKeyPool:
         now = time.time()
         if not force and (now - self.last_save_time < 15):
             return
+            
         async with self.lock:
             self.last_save_time = time.time()
             try:
@@ -231,10 +238,12 @@ class AsyncKeyPool:
         now = time.time()
         info = self.data[key][model]
         self.clean_windows(info, now)
+        
         bj_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
         if info.get("last_reset_date") != bj_now:
             info["tpd_tokens"] = 0
             info["last_reset_date"] = bj_now
+            
         return {
             "current_rpm": len(info["req_timestamps"]), "limit_rpm": info["limit_rpm"],
             "current_rpd": info["requests"], "limit_rpd": info["limit_rpd"],
@@ -245,16 +254,21 @@ class AsyncKeyPool:
     async def get_next_key_for_request(self, target_model: str, exclude_keys: set = None):
         if exclude_keys is None:
             exclude_keys = set()
+            
         now = time.time()
         async with self.lock:
             num_keys = len(self.keys)
             for _ in range(num_keys):
                 key = self.keys[self.index]
-                self.index = (self.index + 1) % num_keys
+                self.index = (self.index + 1) % num_keys  
                 if key in exclude_keys:
                     continue
                 info = self.data[key].get(target_model)
-                if info and info["cooldown"] <= now:
+                if not info:
+                    continue
+                
+                self.clean_windows(info, now)
+                if info["cooldown"] <= now and len(info["req_timestamps"]) < info["limit_rpm"]:
                     return key, target_model
             return None, None
 
@@ -278,31 +292,37 @@ class AsyncKeyPool:
                     info["token_timestamps"].append((now, estimated_tokens))
 
     async def sync_headers_async(self, key: str, model: str, headers: httpx.Headers, actual_tokens: int = 0):
-        if not key or model not in [GLM_MODEL, GPT_MODEL]:
+        if not key or model not in CEREBRAS_MODELS:
             return
         now = time.time()
         bj_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
         try:
             limit_rpd = headers.get("x-ratelimit-limit-requests-day")
             limit_tpm = headers.get("x-ratelimit-limit-tokens-minute")
             rem_rpd = headers.get("x-ratelimit-remaining-requests-day")
             rem_tpm = headers.get("x-ratelimit-remaining-tokens-minute")
+
             async with self.lock:
                 info = self.data[key][model]
                 if limit_rpd is not None: info["limit_rpd"] = int(limit_rpd)
                 if limit_tpm is not None: info["limit_tpm"] = int(limit_tpm)
+                
                 if rem_tpm is not None:
                     used_tpm = max(0, info["limit_tpm"] - int(rem_tpm))
                     info["token_timestamps"].clear()
                     info["token_timestamps"].append((now, used_tpm))
+                
                 if rem_rpd is not None:
                     info["requests"] = max(info["requests"], info["limit_rpd"] - int(rem_rpd))
+                
                 if actual_tokens > 0:
                     if info.get("last_reset_date") != bj_now:
                         info["tpd_tokens"] = 0
                         info["last_reset_date"] = bj_now
                     info["tokens"] += actual_tokens
                     info["tpd_tokens"] += actual_tokens
+                    
                 info["has_synced"] = True
         except Exception:
             if actual_tokens > 0:
@@ -322,17 +342,11 @@ pool = AsyncKeyPool(CEREBRAS_API_KEYS)
 async def lifespan(app: FastAPI):
     await init_global_stats()
     await pool.init_pool_data()
+    await groq_pool.restore_from_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
     yield
+    await async_client.aclose()
 
 app = FastAPI(title="Cerebras OpenAI Gateway", version=VERSION, lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 def sse(data: Any) -> str:
     if isinstance(data, dict):
@@ -414,14 +428,21 @@ def sanitize_body(body: dict, show_thinking: bool, target_model: str = None) -> 
     }
     if new["stream"]:
         new["stream_options"] = {"include_usage": True}
+    
     if not show_thinking:
         model_lower = str(model).lower()
         if "glm" in model_lower:
             new["reasoning_effort"] = "none"
         else:
             new["reasoning_format"] = "hidden"
+
     for k in ["temperature", "top_p", "max_tokens", "presence_penalty", "frequency_penalty"]:
         if k in body: new[k] = body[k]
+        
+    if target_model == GLM_MODEL and "max_completion_tokens" in body:
+        if body["max_completion_tokens"] > 8192:
+            new["max_completion_tokens"] = 8192
+
     if "extra_body" in body and isinstance(body["extra_body"], dict):
         new.update(body["extra_body"])
     return new
@@ -437,20 +458,16 @@ def remove_thinking(obj: dict) -> dict:
         pass
     return obj
 
-def ensure_openai_chunk(chunk: dict, request_id: str, model: str, created: int) -> dict:
-    chunk["id"] = chunk.get("id", request_id)
-    chunk["object"] = "chat.completion.chunk"
-    chunk["created"] = chunk.get("created", created)
-    chunk["model"] = chunk.get("model", model)
-    return chunk
-
 async def add_global_usage_async(model: str, usage: dict):
-    if not usage or model not in GLOBAL_STATS["models"]:
+    if not usage:
         return
     prompt = usage.get("prompt_tokens", 0)
     completion = usage.get("completion_tokens", 0)
     total = usage.get("total_tokens", prompt + completion)
+
     async with stats_lock:
+        if model not in GLOBAL_STATS["models"]:
+            GLOBAL_STATS["models"][model] = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0}
         s = GLOBAL_STATS["models"][model]
         s["requests"] += 1
         s["input_tokens"] += prompt
@@ -463,6 +480,7 @@ async def finish_log_async(request_id: str, request_model: str, key: str, final_
     tokens = usage.get("total_tokens", 0) if usage else 0
     k_last = key[-4:] if key else "-"
     bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    
     item = {
         "time": bj_time, "id": request_id, "model": request_model,
         "key": k_last, "result": "成功", "fallback": final_model if fallback else "",
@@ -470,27 +488,19 @@ async def finish_log_async(request_id: str, request_model: str, key: str, final_
     }
     await add_log_async(item)
 
-def make_openai_error(status: int, message: str, code: str = None) -> JSONResponse:
-    return JSONResponse(
-        status_code=status,
-        content={
-            "error": {
-                "message": message,
-                "type": "api_error",
-                "param": None,
-                "code": code or f"error_{status}"
-            }
-        }
-    )
-
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     start = time.time()
-    request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    request_id = str(uuid.uuid4())[:8]
 
+    # 1. 鉴权校验
     if not check_auth(request):
-        return make_openai_error(401, "Unauthorized API Key", "unauthorized")
+        return JSONResponse(status_code=401, content={
+            "error": {"message": "Unauthorized", "type": "auth_error", "param": None, "code": "unauthorized"},
+            "request_id": request_id
+        })
 
+    # 2. 解析请求体
     try:
         raw = await request.json()
     except Exception:
@@ -500,15 +510,16 @@ async def chat(request: Request):
         GLOBAL_STATS["total_requests"] += 1
     await save_global_stats_async()
 
-    is_stream = bool(raw.get("stream", False))
     request_model = raw.get("model", DEFAULT_MODEL)
 
-    if request_model not in [GLM_MODEL, GPT_MODEL]:
+    # 3. 处理既不在 Cerebras 也不在 Groq 模型列表中的“其他模型”直通逻辑
+    if request_model not in CEREBRAS_MODELS and request_model not in GROQ_MODELS:
         async with stats_lock:
             GLOBAL_STATS["other_models_count"] += 1
         await save_global_stats_async()
+
         if not CEREBRAS_API_KEYS:
-            return make_openai_error(500, "No physical keys configured")
+            return JSONResponse(status_code=500, content={"error": {"message": "No physical keys configured"}})
         try:
             r = await async_client.post(
                 f"{CEREBRAS_BASE_URL}/chat/completions",
@@ -526,28 +537,15 @@ async def chat(request: Request):
             })
             return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
         except Exception as e:
-            return make_openai_error(500, str(e))
+            return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
 
+    # 4. 尝试 Cerebras 模型池轮询
     show_thinking = final_thinking(raw)
-
-    models_to_try = []
-    if MODEL_FALLBACK_MODE == "force_gpt":
-        models_to_try = [GPT_MODEL]
-    elif MODEL_FALLBACK_MODE == "off":
-        models_to_try = [request_model]
-    else:
-        models_to_try = [request_model]
-        if request_model == GLM_MODEL:
-            models_to_try.append(GPT_MODEL)
-
+    models_to_try = [GEMMA_MODEL, GLM_MODEL, GPT_MODEL] if request_model not in CEREBRAS_MODELS else [request_model] + [m for m in CEREBRAS_MODELS if m != request_model]
+    
     last_error = None
-    final_model_used = None
-    fallback_happened = False
 
     for target_model in models_to_try:
-        if target_model != request_model:
-            fallback_happened = True
-
         body = sanitize_body(raw, show_thinking, target_model=target_model)
         tried_keys = set()
         max_attempts = len(CEREBRAS_API_KEYS)
@@ -560,69 +558,67 @@ async def chat(request: Request):
             tried_keys.add(selected_key)
             estimated_in = estimate_tokens(messages=raw.get("messages", []))
             body["model"] = selected_model
+            await pool.record_request_attempt_async(selected_key, selected_model, estimated_in)
 
-            cerebro_req = async_client.build_request(
-                "POST",
-                f"{CEREBRAS_BASE_URL}/chat/completions",
-                json=body,
-                headers={"Authorization": f"Bearer {selected_key}", "Content-Type": "application/json"},
-                timeout=60.0
-            )
+            fallback_happened = (selected_model != request_model)
 
-            if is_stream:
-                await pool.record_request_attempt_async(selected_key, selected_model, estimated_in)
+            # --- 流式请求处理 ---
+            if body.get("stream", False):
+                try:
+                    req = async_client.build_request(
+                        "POST",
+                        f"{CEREBRAS_BASE_URL}/chat/completions",
+                        json=body,
+                        headers={"Authorization": f"Bearer {selected_key}", "Content-Type": "application/json"},
+                        timeout=60.0
+                    )
+                    response = await async_client.send(req, stream=True)
 
-                async def event_generator():
-                    nonlocal last_error
-                    last_usage = None
-                    generated_text = ""
-                    stream_chunks = []
-                    is_truncated = False
-                    response = None
-                    created_time = int(time.time())
-                    has_sent_first = False
+                    # 如果非 200 响应，清理并尝试下一个 Key/Model
+                    if response.status_code != 200:
+                        if response.status_code == 429:
+                            async with stats_lock: GLOBAL_STATS["429_count"] += 1
+                            await save_global_stats_async()
+                            last_error = f"429 Limit reached on ****{selected_key[-4:]}"
+                        else:
+                            last_error = f"Upstream error {response.status_code}"
 
-                    try:
-                        response = await async_client.send(cerebro_req, stream=True)
+                        await pool.cooldown_async(selected_key, selected_model)
+                        await pool.sync_headers_async(selected_key, selected_model, response.headers)
+                        await response.aclose()
+                        continue
 
-                        if response.status_code == 200:
-                            await pool.sync_headers_async(selected_key, selected_model, response.headers)
-                            await pool.success_async(selected_key, selected_model)
-                            nonlocal final_model_used
-                            final_model_used = selected_model
+                    # 只有 200 OK 成功建立流连接后才返回 StreamingResponse
+                    await pool.sync_headers_async(selected_key, selected_model, response.headers)
+                    await pool.success_async(selected_key, selected_model)
 
+                    async def event_generator():
+                        last_usage = None
+                        generated_text = ""
+                        stream_chunks = []
+                        is_truncated = False
+
+                        try:
                             async for line in response.aiter_lines():
                                 if not line: continue
                                 line_str = line.strip()
                                 if not line_str.startswith("data:"): continue
                                 data_body = line_str[5:].strip()
+
                                 if data_body == "[DONE]":
                                     yield "data: [DONE]\n\n"
                                     break
+
                                 try:
                                     obj = json.loads(data_body)
-
-                                    if not has_sent_first:
-                                        has_sent_first = True
-                                        if not obj.get("choices") or not obj["choices"][0].get("delta", {}).get("role"):
-                                            first = {
-                                                "id": request_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created_time,
-                                                "model": selected_model,
-                                                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
-                                            }
-                                            yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
-
-                                    obj = ensure_openai_chunk(obj, request_id, selected_model, created_time)
-
                                     if "usage" in obj and obj["usage"]:
                                         last_usage = obj["usage"]
+
                                     for choice in obj.get("choices", []):
                                         if choice.get("finish_reason") == "length":
                                             is_truncated = True
                                         delta = choice.get("delta", {})
-                                        if isinstance(delta.get("content"), str):
+                                        if "content" in delta and delta["content"]:
                                             generated_text += delta["content"]
 
                                     if not show_thinking:
@@ -635,137 +631,157 @@ async def chat(request: Request):
                                 except Exception:
                                     yield line_str + "\n\n"
 
-                        elif response.status_code == 429:
-                            async with stats_lock: GLOBAL_STATS["429_count"] += 1
-                            await save_global_stats_async()
-                            await pool.cooldown_async(selected_key, selected_model)
-                            err = {"error": {"message": f"429 on ****{selected_key[-4:]}", "type": "rate_limit", "code": 429}}
-                            yield sse(err)
-                            return
-                        else:
-                            err = {"error": {"message": f"Upstream {response.status_code}", "type": "api_error", "code": response.status_code}}
-                            yield sse(err)
-                            return
-
-                    except Exception as e:
-                        await pool.cooldown_async(selected_key, selected_model)
-                        err = {"error": {"message": str(e), "type": "internal_error", "code": 500}}
-                        yield sse(err)
-                        return
-
-                    finally:
-                        if response and response.status_code == 200:
+                        finally:
+                            # 保证流结束或异常断开时能正确收尾
                             if is_truncated:
                                 async with stats_lock: GLOBAL_STATS["truncated_count"] += 1
                                 await save_global_stats_async()
+
                             if not last_usage:
                                 out_tokens = estimate_tokens(text_content=generated_text)
                                 last_usage = {"prompt_tokens": estimated_in, "completion_tokens": out_tokens, "total_tokens": estimated_in + out_tokens}
+
                             await add_global_usage_async(selected_model, last_usage)
                             await pool.sync_headers_async(selected_key, selected_model, response.headers, actual_tokens=last_usage.get("total_tokens", 0))
+
                             if fallback_happened:
                                 async with stats_lock: GLOBAL_STATS["fallback_count"] += 1
                                 await save_global_stats_async()
+
                             await finish_log_async(request_id, request_model, selected_key, selected_model, fallback_happened, start, last_usage)
+
                             bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-                            trunc_flag = " [截断]" if is_truncated else ""
-                            resp_str = f"【流式】{trunc_flag}:\n{generated_text}\n\n【样例】:\n" + "".join(stream_chunks[:10])
+                            trunc_flag = " [⚠️ 长度截断]" if is_truncated else ""
+                            resp_debug_str = f"【流式输出】{trunc_flag}:\n{generated_text}\n\n【SSE Chunk 样例】:\n" + "".join(stream_chunks[:10])
                             await add_debug_log_async({
                                 "id": request_id, "time": bj_time, "request_model": request_model,
                                 "final_model": selected_model, "key": selected_key[-4:], "status_code": 200,
                                 "time_cost": round(time.time() - start, 2),
                                 "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
-                                "response_body": truncate_text(resp_str)
+                                "response_body": truncate_text(resp_debug_str)
                             })
-                            if response:
-                                await response.aclose()
+                            await response.aclose()
 
-                return StreamingResponse(
-                    event_generator(),
-                    media_type="text/event-stream",
-                    headers={
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no"
-                    }
-                )
-
-            else:
-                await pool.record_request_attempt_async(selected_key, selected_model, estimated_in)
-                try:
-                    r = await async_client.send(cerebro_req)
-
-                    if r.status_code == 200:
-                        result = r.json()
-                        await pool.success_async(selected_key, selected_model)
-                        final_model_used = selected_model
-                        is_truncated = False
-
-                        created_time = result.get("created", int(time.time()))
-
-                        if "id" not in result:
-                            result["id"] = request_id
-                        result["object"] = "chat.completion"
-
-                        for choice in result.get("choices", []):
-                            if choice.get("finish_reason") == "length":
-                                is_truncated = True
-
-                        if is_truncated:
-                            async with stats_lock: GLOBAL_STATS["truncated_count"] += 1
-                            await save_global_stats_async()
-
-                        usage = result.get("usage")
-                        if not usage:
-                            text_out = ""
-                            for choice in result.get("choices", []):
-                                msg = choice.get("message", {})
-                                if isinstance(msg.get("content"), str):
-                                    text_out += msg["content"]
-                            out_tokens = estimate_tokens(text_content=text_out)
-                            usage = {"prompt_tokens": estimated_in, "completion_tokens": out_tokens, "total_tokens": estimated_in + out_tokens}
-                            result["usage"] = usage
-
-                        await add_global_usage_async(selected_model, usage)
-                        await pool.sync_headers_async(selected_key, selected_model, r.headers, actual_tokens=usage.get("total_tokens", 0))
-
-                        if not show_thinking:
-                            result = remove_thinking(result)
-
-                        if fallback_happened:
-                            async with stats_lock: GLOBAL_STATS["fallback_count"] += 1
-                            await save_global_stats_async()
-
-                        await finish_log_async(request_id, request_model, selected_key, selected_model, fallback_happened, start, usage)
-
-                        bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-                        await add_debug_log_async({
-                            "id": request_id, "time": bj_time, "request_model": request_model,
-                            "final_model": selected_model, "key": selected_key[-4:], "status_code": 200,
-                            "time_cost": round(time.time() - start, 2),
-                            "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
-                            "response_body": truncate_text(json.dumps(result, ensure_ascii=False, indent=2))
-                        })
-
-                        return JSONResponse(status_code=200, content=result)
-
-                    elif r.status_code == 429:
-                        async with stats_lock: GLOBAL_STATS["429_count"] += 1
-                        await save_global_stats_async()
-                        await pool.cooldown_async(selected_key, selected_model)
-                        await pool.sync_headers_async(selected_key, selected_model, r.headers)
-                        last_error = {"type": "429", "key": selected_key[-4:], "model": selected_model}
-                        continue
-                    else:
-                        last_error = {"type": "http_error", "code": r.status_code, "key": selected_key[-4:], "model": selected_model}
-                        continue
+                    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
                 except Exception as e:
                     await pool.cooldown_async(selected_key, selected_model)
-                    last_error = {"type": "exception", "message": str(e), "key": selected_key[-4:], "model": selected_model}
+                    last_error = str(e)
                     continue
 
-    error_msg = f"All keys/models failed. Last: {json.dumps(last_error)}" if last_error else "No keys available"
+            # --- 非流式请求处理 ---
+            try:
+                r = await async_client.post(
+                    f"{CEREBRAS_BASE_URL}/chat/completions",
+                    json=body,
+                    headers={"Authorization": f"Bearer {selected_key}", "Content-Type": "application/json"},
+                    timeout=60.0
+                )
+
+                if r.status_code == 200:
+                    result = r.json()
+                    await pool.success_async(selected_key, selected_model)
+                    is_truncated = any(choice.get("finish_reason") == "length" for choice in result.get("choices", []))
+
+                    if is_truncated:
+                        async with stats_lock: GLOBAL_STATS["truncated_count"] += 1
+                        await save_global_stats_async()
+
+                    usage = result.get("usage")
+                    if not usage:
+                        text_out = "".join(
+                            choice.get("message", {}).get("content", "")
+                            for choice in result.get("choices", [])
+                            if choice.get("message", {}).get("content")
+                        )
+                        out_tokens = estimate_tokens(text_content=text_out)
+                        usage = {"prompt_tokens": estimated_in, "completion_tokens": out_tokens, "total_tokens": estimated_in + out_tokens}
+                        result["usage"] = usage
+
+                    await add_global_usage_async(selected_model, usage)
+                    await pool.sync_headers_async(selected_key, selected_model, r.headers, actual_tokens=usage.get("total_tokens", 0))
+
+                    if not show_thinking:
+                        result = remove_thinking(result)
+
+                    if fallback_happened:
+                        async with stats_lock: GLOBAL_STATS["fallback_count"] += 1
+                        await save_global_stats_async()
+
+                    await finish_log_async(request_id, request_model, selected_key, selected_model, fallback_happened, start, usage)
+
+                    bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+                    await add_debug_log_async({
+                        "id": request_id, "time": bj_time, "request_model": request_model,
+                        "final_model": selected_model, "key": selected_key[-4:], "status_code": 200,
+                        "time_cost": round(time.time() - start, 2),
+                        "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
+                        "response_body": truncate_text(json.dumps(result, ensure_ascii=False, indent=2))
+                    })
+
+                    return JSONResponse(status_code=200, content=result)
+
+                elif r.status_code == 429:
+                    async with stats_lock: GLOBAL_STATS["429_count"] += 1
+                    await save_global_stats_async()
+                    await pool.cooldown_async(selected_key, selected_model)
+                    await pool.sync_headers_async(selected_key, selected_model, r.headers)
+                    last_error = f"429 Limit reached on ****{selected_key[-4:]}"
+                    continue
+                else:
+                    last_error = f"Upstream error {r.status_code}"
+                    continue
+
+            except Exception as e:
+                await pool.cooldown_async(selected_key, selected_model)
+                last_error = str(e)
+                continue
+
+    # 5. Cerebras 全部失败后，降级尝试 Groq
+    groq_resp, groq_model, groq_key = await execute_groq_request(async_client, raw, show_thinking)
+
+    if groq_resp and groq_model and groq_key:
+        async with stats_lock:
+            GLOBAL_STATS["groq_fallback_count"] += 1
+            GLOBAL_STATS["fallback_count"] += 1
+        await save_global_stats_async()
+
+        if raw.get("stream", False):
+            async def groq_stream_gen():
+                try:
+                    async for chunk in groq_resp.aiter_bytes():
+                        yield chunk
+                finally:
+                    await groq_resp.aclose()
+                    await groq_pool.record_success(groq_key)
+                    await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
+                    await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", True, start)
+
+            return StreamingResponse(groq_stream_gen(), media_type="text/event-stream")
+        else:
+            try:
+                res_data = groq_resp.json()
+                usage = res_data.get("usage", {})
+                tot_tok = usage.get("total_tokens", 0)
+                await add_global_usage_async(groq_model, usage)
+                await groq_pool.record_success(groq_key, tot_tok)
+                await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
+                await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", True, start, usage)
+
+                bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+                await add_debug_log_async({
+                    "id": request_id, "time": bj_time, "request_model": request_model,
+                    "final_model": f"groq:{groq_model}", "key": groq_key[-4:], "status_code": 200,
+                    "time_cost": round(time.time() - start, 2),
+                    "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
+                    "response_body": truncate_text(json.dumps(res_data, ensure_ascii=False, indent=2))
+                })
+                return JSONResponse(status_code=200, content=res_data)
+            finally:
+                await groq_resp.aclose()
+
+    # 6. 所有 Provider、模型、Key 均失败
+    error_msg = f"All Cerebras and Groq keys/models failed. Last error: {last_error}"
     bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     await add_debug_log_async({
         "id": request_id, "time": bj_time, "request_model": request_model,
@@ -775,53 +791,17 @@ async def chat(request: Request):
         "response_body": truncate_text(error_msg)
     })
 
-    return make_openai_error(503, error_msg, "all_keys_failed")
-
-@app.get("/v1")
-async def root_v1():
-    return JSONResponse(content={"status": "ok", "message": "Cerebras OpenAI Gateway", "version": VERSION})
-
-@app.get("/v1/models")
-@app.get("/v1/models/{model_id}")
-async def list_models(model_id: Optional[str] = None):
-    created_ts = int(time.time())
-    models_data = [
-        {
-            "id": GLM_MODEL,
-            "object": "model",
-            "created": created_ts,
-            "owned_by": "cerebras",
-            "permission": [],
-            "root": GLM_MODEL,
-            "parent": None
-        },
-        {
-            "id": GPT_MODEL,
-            "object": "model",
-            "created": created_ts,
-            "owned_by": "cerebras",
-            "permission": [],
-            "root": GPT_MODEL,
-            "parent": None
-        }
-    ]
-    if model_id:
-        for m in models_data:
-            if m["id"] == model_id:
-                return JSONResponse(content=m)
-        return make_openai_error(404, f"Model '{model_id}' not found", "model_not_found")
-    return JSONResponse(content={"object": "list", "data": models_data})
-
-@app.get("/health")
-async def health():
-    return JSONResponse(content={"status": "ok", "version": VERSION, "keys_loaded": len(CEREBRAS_API_KEYS)})
+    return JSONResponse(status_code=503, content={
+        "error": {"message": error_msg, "type": "service_unavailable", "param": None, "code": "all_providers_failed"},
+        "request_id": request_id
+    })
 
 @app.get("/menu", response_class=HTMLResponse)
 @app.get("/", response_class=HTMLResponse)
 async def menu():
-    body = f"""<h2>🧠 Cerebras OpenAI API Gateway Menu</h2>
+    body = f"""<h2>🧠 Cerebras OpenAI Gateway Menu</h2>
 <p><strong>Version:</strong> {VERSION}</p>
-<p style="color: #9ca3af; font-size: 14px; margin-top: -10px;">作者：速冻月饼</p>
+<p style="color: #9ca3af; font-size: 14px; margin-top: -10px;">作者：速冻月饼 | 🔗 <a href="https://github.com/xyrct301/cerebras-proxy-re" target="_blank">GitHub 开源仓库</a></p>
 <hr style="border-color:#1e293b;"/>
 <h3>📌 API Endpoint</h3>
 <p>🔗 <a href="/v1/models" target="_blank">/v1/models (查看可用模型列表)</a></p>
@@ -834,29 +814,45 @@ async def menu():
 <p>❤️ <a href="/health">/health (微服务健康检查)</a></p>
 <h3>🎛️ 控制策略 (Control Center)</h3>
 <p>⚙️ <a href="/thinkingdisplay">/thinkingdisplay (深度思考输出控制: {THINKING_MODE.upper()})</a></p>
-<p>🔀 <a href="/fallbackmode">/fallbackmode (GLM->GPT 降级策略控制: {MODEL_FALLBACK_MODE.upper()})</a></p>
-<h3> 默认托管模型</h3>
-<pre style="background:#1f2937; padding:12px; border-radius:6px; border:1px solid #374151;">{DEFAULT_MODEL}</pre>"""
+<p>🔀 <a href="/fallbackmode">/fallbackmode (模型降级策略控制: {MODEL_FALLBACK_MODE.upper()})</a></p>
+<h3>🤖 托管模型矩阵</h3>
+<pre style="background:#1f2937; padding:12px; border-radius:6px; border:1px solid #374151;">
+Cerebras ({len(CEREBRAS_MODELS)}): {', '.join(CEREBRAS_MODELS)}
+Groq ({len(GROQ_MODELS)}): {', '.join(GROQ_MODELS)}
+</pre>"""
     return HTMLResponse(content=html_page("Menu", body))
 
 @app.get("/status", response_class=HTMLResponse)
 async def status():
     now = time.time()
-    global_limits = {
-        GLM_MODEL: {"rpm": 0, "rpd": 0, "tpm": 0, "tpd": 0, "cur_rpm": 0, "cur_rpd": 0, "cur_tpm": 0, "cur_tpd": 0},
-        GPT_MODEL: {"rpm": 0, "rpd": 0, "tpm": 0, "tpd": 0, "cur_rpm": 0, "cur_rpd": 0, "cur_tpm": 0, "cur_tpd": 0}
-    }
+    
+    # --- Cerebras 限额统计 ---
+    cerebras_global_limits = {m: {"rpm": 0, "rpd": 0, "tpm": 0, "tpd": 0, "cur_rpm": 0, "cur_rpd": 0, "cur_tpm": 0, "cur_tpd": 0} for m in CEREBRAS_MODELS}
     for key in CEREBRAS_API_KEYS:
-        for model in [GLM_MODEL, GPT_MODEL]:
+        for model in CEREBRAS_MODELS:
             metrics = pool.get_current_metrics(key, model)
-            global_limits[model]["rpm"] += metrics["limit_rpm"]
-            global_limits[model]["rpd"] += metrics["limit_rpd"]
-            global_limits[model]["tpm"] += metrics["limit_tpm"]
-            global_limits[model]["tpd"] += metrics["limit_tpd"]
-            global_limits[model]["cur_rpm"] += metrics["current_rpm"]
-            global_limits[model]["cur_rpd"] += metrics["current_rpd"]
-            global_limits[model]["cur_tpm"] += metrics["current_tpm"]
-            global_limits[model]["cur_tpd"] += metrics["current_tpd"]
+            cerebras_global_limits[model]["rpm"] += metrics["limit_rpm"]
+            cerebras_global_limits[model]["rpd"] += metrics["limit_rpd"]
+            cerebras_global_limits[model]["tpm"] += metrics["limit_tpm"]
+            cerebras_global_limits[model]["tpd"] += metrics["limit_tpd"]
+            cerebras_global_limits[model]["cur_rpm"] += metrics["current_rpm"]
+            cerebras_global_limits[model]["cur_rpd"] += metrics["current_rpd"]
+            cerebras_global_limits[model]["cur_tpm"] += metrics["current_tpm"]
+            cerebras_global_limits[model]["cur_tpd"] += metrics["current_tpd"]
+
+    # --- Groq 限额统计 ---
+    groq_global_limits = {m: {"rpm": 0, "rpd": 0, "tpm": 0, "tpd": 0, "cur_rpm": 0, "cur_rpd": 0, "cur_tpm": 0, "cur_tpd": 0} for m in GROQ_MODELS}
+    for key in groq_pool.keys:
+        for model in GROQ_MODELS:
+            metrics = groq_pool.get_current_metrics(key, model)
+            groq_global_limits[model]["rpm"] += metrics["limit_rpm"]
+            groq_global_limits[model]["rpd"] += metrics["limit_rpd"]
+            groq_global_limits[model]["tpm"] += metrics["limit_tpm"]
+            groq_global_limits[model]["tpd"] += metrics["limit_tpd"]
+            groq_global_limits[model]["cur_rpm"] += metrics["current_rpm"]
+            groq_global_limits[model]["cur_rpd"] += metrics["current_rpd"]
+            groq_global_limits[model]["cur_tpm"] += metrics["current_tpm"]
+            groq_global_limits[model]["cur_tpd"] += metrics["current_tpd"]
 
     def render_progress(cur, limit):
         pct = min(100, round((cur / limit * 100), 1)) if limit > 0 else 0
@@ -867,54 +863,121 @@ async def status():
         """
 
     html = f"""
-    <h2>📊 Cerebras Gateway 实时监控看板 <span class="tag">v{VERSION}</span></h2>
+    <h2>📊 Gateway 实时监控看板 <span class="tag">v{VERSION}</span></h2>
     <div class="grid-2" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-top:15px;">
-        <div class="card"><div class="tag">总进站请求</div><div style="font-size:28px; font-weight:bold; margin-top:4px;">{GLOBAL_STATS['total_requests']}</div></div>
-        <div class="card"><div class="tag">降级接管 (Fallback)</div><div style="font-size:28px; font-weight:bold; color:#eab308; margin-top:4px;">{GLOBAL_STATS['fallback_count']}</div></div>
-        <div class="card"><div class="tag">🚨 触发长度截断</div><div style="font-size:28px; font-weight:bold; color:#f97316; margin-top:4px;">{GLOBAL_STATS.get('truncated_count', 0)}</div></div>
-        <div class="card"><div class="tag">上游 429 阻断</div><div style="font-size:28px; font-weight:bold; color:#ef4444; margin-top:4px;">{GLOBAL_STATS['429_count']}</div></div>
-        <div class="card"><div class="tag">旁路透传模型</div><div style="font-size:28px; font-weight:bold; color:#a855f7; margin-top:4px;">{GLOBAL_STATS['other_models_count']}</div></div>
+        <div class="card">
+            <div class="tag">总进站请求</div>
+            <div style="font-size:28px; font-weight:bold; margin-top:4px;">{GLOBAL_STATS['total_requests']}</div>
+        </div>
+        <div class="card">
+            <div class="tag">降级接管 (Fallback)</div>
+            <div style="font-size:28px; font-weight:bold; color:#eab308; margin-top:4px;">{GLOBAL_STATS['fallback_count']}</div>
+        </div>
+        <div class="card">
+            <div class="tag">⚡ Groq 应急降级计数</div>
+            <div style="font-size:28px; font-weight:bold; color:#38bdf8; margin-top:4px;">{GLOBAL_STATS.get('groq_fallback_count', 0)}</div>
+        </div>
+        <div class="card">
+            <div class="tag">🚨 触发长度截断</div>
+            <div style="font-size:28px; font-weight:bold; color:#f97316; margin-top:4px;">{GLOBAL_STATS.get('truncated_count', 0)}</div>
+        </div>
+        <div class="card">
+            <div class="tag">上游 429 阻断</div>
+            <div style="font-size:28px; font-weight:bold; color:#ef4444; margin-top:4px;">{GLOBAL_STATS['429_count']}</div>
+        </div>
     </div>
-    <h3>🔮 托管模型全局汇总 (All Keys Combined)</h3>
+    
+    <h3>🔮 Cerebras 核心模型额度汇总</h3>
     <div class="grid-2">
     """
-    for model in [GLM_MODEL, GPT_MODEL]:
-        g_data = GLOBAL_STATS["models"][model]
-        g_lim = global_limits[model]
+    
+    for model in CEREBRAS_MODELS:
+        g_data = GLOBAL_STATS["models"].get(model, {"requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0})
+        g_lim = cerebras_global_limits[model]
         html += f"""
         <div class="card">
             <div style="font-size:16px; font-weight:bold; color:#60a5fa; margin-bottom:12px;">📌 模型: {model}</div>
             <div class="metric-row"><span class="tag">累计处理请求:</span> <strong>{g_data['requests']}</strong></div>
             <div class="metric-row"><span class="tag">输入 / 输出 Tokens:</span> <span>{g_data['input_tokens']} / {g_data['output_tokens']}</span></div>
             <div class="metric-row" style="border-bottom:1px solid #374151; padding-bottom:8px; margin-bottom:12px;"><span class="tag">历史总耗费 Tokens:</span> <strong style="color:#10b981;">{g_data['tokens']}</strong></div>
-            <div style="font-size:13px; font-weight:bold; margin-bottom:6px; color:#9ca3af;">实时全负载动态额度水位:</div>
             <div class="tag">RPM (每分钟请求数)</div>{render_progress(g_lim['cur_rpm'], g_lim['rpm'])}
             <div class="tag">RPD (每日请求数)</div>{render_progress(g_lim['cur_rpd'], g_lim['rpd'])}
             <div class="tag">TPM (每分钟Tokens)</div>{render_progress(g_lim['cur_tpm'], g_lim['tpm'])}
-            <div class="tag">TPD (每日Tokens)</div>{render_progress(g_lim['cur_tpd'], g_lim['tpd'])}
         </div>
         """
     html += "</div>"
-    html += "<h3>🔑 物理 API-Key 状态细节矩阵</h3><div class='grid-2'>"
+
+    # === Groq 托管模型全局汇总 ===
+    html += "<h3>⚡ Groq 托管模型全局汇总</h3><div class='grid-2'>"
+    for gm in GROQ_MODELS:
+        g_data = GLOBAL_STATS["models"].get(gm, {"requests": 0, "input_tokens": 0, "output_tokens": 0, "tokens": 0})
+        g_lim = groq_global_limits[gm]
+        html += f"""
+        <div class="card" style="border-left: 4px solid #38bdf8;">
+            <div style="font-size:16px; font-weight:bold; color:#38bdf8; margin-bottom:12px;">🤖 Groq: {gm}</div>
+            <div class="metric-row"><span class="tag">累计处理请求:</span> <strong>{g_data['requests']}</strong></div>
+            <div class="metric-row"><span class="tag">输入 / 输出 Tokens:</span> <span>{g_data['input_tokens']} / {g_data['output_tokens']}</span></div>
+            <div class="metric-row" style="border-bottom:1px solid #374151; padding-bottom:8px; margin-bottom:12px;"><span class="tag">历史总耗费 Tokens:</span> <strong style="color:#10b981;">{g_data['tokens']}</strong></div>
+            <div class="tag">RPM (每分钟请求数)</div>{render_progress(g_lim['cur_rpm'], g_lim['rpm'])}
+            <div class="tag">RPD (每日请求数)</div>{render_progress(g_lim['cur_rpd'], g_lim['rpd'])}
+            <div class="tag">TPM (每分钟Tokens)</div>{render_progress(g_lim['cur_tpm'], g_lim['tpm'])}
+        </div>
+        """
+    html += "</div>"
+
+    # === Cerebras 物理 API-Key 状态细节矩阵 ===
+    html += "<h3>🔑 Cerebras API-Key 细节矩阵</h3><div class='grid-2'>"
     for key in CEREBRAS_API_KEYS:
         k_suffix = key[-4:] if len(key) > 4 else key
         html += f"""<div class="card" style="border-left: 4px solid #3b82f6;"><div style="font-weight:bold; font-size:15px; margin-bottom:12px;">🗝️ Key: ****{k_suffix}</div>"""
-        for model in [GLM_MODEL, GPT_MODEL]:
+        for model in CEREBRAS_MODELS:
             info = pool.data[key][model]
             cd = max(0, int(info["cooldown"] - now))
-            badge = f'<span class="badge badge-red">🔴 冷却中 ({cd}s)</span>' if cd > 0 else '<span class="badge badge-green">🟢 正常</span>'
+            status_badge = f'<span class="badge badge-red">🔴 冷却 ({cd}s)</span>' if cd > 0 else '<span class="badge badge-green">🟢 正常</span>'
             metrics = pool.get_current_metrics(key, model)
-            html += f"""<div style="background:#111827; padding:10px; border-radius:6px; margin-bottom:10px; border:1px solid #374151;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;"><span style="font-size:12px; font-weight:bold; color:#9ca3af;">🤖 {model}</span>{badge}</div>
+            html += f"""
+            <div style="background:#111827; padding:10px; border-radius:6px; margin-bottom:10px; border:1px solid #374151;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                    <span style="font-size:12px; font-weight:bold; color:#9ca3af;">🤖 {model}</span>
+                    {status_badge}
+                </div>
                 <div style="font-size:11px; color:#d1d5db; display:grid; grid-template-columns:1fr 1fr; gap:4px;">
                     <div>RPM: {metrics['current_rpm']}/{metrics['limit_rpm']}</div>
                     <div>RPD: {metrics['current_rpd']}/{metrics['limit_rpd']}</div>
-                    <div>TPM: {metrics['current_tpm']}/{metrics['limit_tpm']}</div>
-                    <div>TPD: {metrics['current_tpd']}/{metrics['limit_tpd']}</div>
                 </div>
-            </div>"""
+            </div>
+            """
         html += "</div>"
     html += "</div>"
+
+    # === Groq 物理 API-Key 状态细节矩阵 ===
+    html += "<h3>⚡ Groq API-Key 细节矩阵</h3><div class='grid-2'>"
+    if groq_pool.keys:
+        for key in groq_pool.keys:
+            k_suffix = key[-4:] if len(key) > 4 else key
+            html += f"""<div class="card" style="border-left: 4px solid #38bdf8;"><div style="font-weight:bold; font-size:15px; margin-bottom:12px;">🗝️ Key: ****{k_suffix}</div>"""
+            for model in GROQ_MODELS:
+                info = groq_pool.data.get(key, {}).get(model, {"cooldown": 0})
+                cd = max(0, int(info.get("cooldown", 0) - now))
+                status_badge = f'<span class="badge badge-red">🔴 冷却 ({cd}s)</span>' if cd > 0 else '<span class="badge badge-green">🟢 正常</span>'
+                metrics = groq_pool.get_current_metrics(key, model)
+                html += f"""
+                <div style="background:#111827; padding:10px; border-radius:6px; margin-bottom:10px; border:1px solid #374151;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+                        <span style="font-size:12px; font-weight:bold; color:#9ca3af;">🤖 {model}</span>
+                        {status_badge}
+                    </div>
+                    <div style="font-size:11px; color:#d1d5db; display:grid; grid-template-columns:1fr 1fr; gap:4px;">
+                        <div>RPM: {metrics['current_rpm']}/{metrics['limit_rpm']}</div>
+                        <div>RPD: {metrics['current_rpd']}/{metrics['limit_rpd']}</div>
+                    </div>
+                </div>
+                """
+            html += "</div>"
+    else:
+        html += "<p class='tag'>未配置 GROQ_API_KEYS</p>"
+    html += "</div>"
+
     return HTMLResponse(content=html_page("Status 看板", html))
 
 @app.get("/log", response_class=HTMLResponse)
@@ -922,11 +985,15 @@ async def log_page():
     lines = ["="*50, "📜 历史回溯请求日志 (最近100条)", "="*50]
     async with log_lock:
         for x in REQUEST_LOGS:
-            fb = f" | 🔄 降级至->{x['fallback']}" if x['fallback'] else " | ✅ 成功"
-            lines.append(f"[{x['time']}] ID:{x['id']} | {x['model']} (Key:****{x['key']}){fb} | Tokens:{x['tokens']} | 耗时:{x['time_cost']}s")
+            fallback_text = f" | 🔄 降级至->{x['fallback']}" if x['fallback'] else " | ✅ 成功"
+            lines.append(
+                f"[{x['time']}] ID:{x['id']} | {x['model']} (Key:****{x['key']}){fallback_text} | Tokens:{x['tokens']} | 耗时:{x['time_cost']}s"
+            )
     log_content = "\n".join(lines)
-    html_body = f"""<h2>📜 历史回溯请求日志</h2>
-    <div style="background:#1f2937; color:#f3f4f6; padding:15px; border-radius:6px; border:1px solid #374151; white-space: pre-wrap; word-break: break-all; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; line-height: 1.6;">{log_content}</div>"""
+    html_body = f"""
+    <h2>📜 历史回溯请求日志</h2>
+    <div style="background:#1f2937; color:#f3f4f6; padding:15px; border-radius:6px; border:1px solid #374151; white-space: pre-wrap; word-break: break-all; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; line-height: 1.6;">{log_content}</div>
+    """
     return HTMLResponse(content=html_page("Request Logs", html_body))
 
 @app.api_route("/debug", methods=["GET", "POST"], response_class=HTMLResponse)
@@ -935,20 +1002,29 @@ async def debug(request: Request, password: Optional[str] = Form(None), debug_au
         auth_token = debug_auth_token or password
         valid_set = CUSTOM_API_KEYS | VALID_DEBUG_PASSWORDS
         if not auth_token or auth_token not in valid_set:
-            login_form = """<h2>🔒 Debug 面板访问受限</h2>
-            <form method="POST"><input type="password" name="password" placeholder="请输入 Debug 访问密钥" style="padding:8px; border-radius:4px; border:1px solid #374151; background:#1f2937; color:#fff;"/>
-            <button type="submit" style="padding:8px 15px; background:#3b82f6; color:#fff; border:none; border-radius:4px; cursor:pointer;">登录</button></form>"""
+            login_form = """
+            <h2>🔒 Debug 面板访问受限</h2>
+            <form method="POST">
+                <input type="password" name="password" placeholder="请输入 Debug 访问密钥" style="padding:8px; border-radius:4px; border:1px solid #374151; background:#1f2937; color:#fff;"/>
+                <button type="submit" style="padding:8px 15px; background:#3b82f6; color:#fff; border:none; border-radius:4px; cursor:pointer;">登录</button>
+            </form>
+            """
             return HTMLResponse(content=html_page("Debug 鉴权", login_form))
-    copy_script = """<script>
+
+    copy_script = """
+    <script>
     function copyDebugInfo(idx) {
-        const el = document.getElementById('resp-body-'+idx);
-        const text = el ? el.innerText : '';
-        navigator.clipboard.writeText(text).then(()=>{alert('复制成功！');}).catch(err=>{alert('复制失败: '+err);});
+        const respEl = document.getElementById('resp-body-' + idx);
+        const text = respEl ? respEl.innerText : '';
+        navigator.clipboard.writeText(text).then(() => { alert('复制成功！'); }).catch(err => { alert('复制失败: ' + err); });
     }
-    </script>"""
+    </script>
+    """
+
     items_html = []
     async with debug_log_lock:
         logs = list(DEBUG_LOGS)
+    
     for idx, item in enumerate(logs):
         req_id = item.get("id", "N/A")
         req_model = item.get("request_model", "N/A")
@@ -957,17 +1033,41 @@ async def debug(request: Request, password: Optional[str] = Form(None), debug_au
         status_code = item.get("status_code", "N/A")
         time_cost = item.get("time_cost", "N/A")
         log_time = item.get("time", "")
+        
         req_body = str(item.get("request_body", "")).replace("<", "&lt;").replace(">", "&gt;")
         resp_body = str(item.get("response_body", "")).replace("<", "&lt;").replace(">", "&gt;")
-        card = f"""<div style="background:#111827; border:1px solid #374151; border-radius:8px; padding:15px; margin-bottom:15px;">
-        <details><summary style="cursor:pointer; color:#60a5fa; font-weight:bold;">#{idx+1} | [{log_time}] ID: {req_id} | Status: {status_code} | Time: {time_cost}s</summary>
-        <div style="margin-top:10px; color:#9ca3af; font-size:13px;"><p style="margin:4px 0;">• <b>请求模型:</b> {req_model}</p><p style="margin:4px 0;">• <b>最终模型:</b> {final_model} (Key: ****{key_used})</p></div>
-        <div style="margin-top:10px;"><strong style="color:#60a5fa;">【Request Body】:</strong><pre style="background:#1f2937; padding:10px; border-radius:4px; overflow-x:auto; max-height:300px; color:#f3f4f6; font-size:12px;">{req_body}</pre></div>
-        <div style="margin-top:10px;"><strong style="color:#34d399;">【Response Body】:</strong><pre id="resp-body-{idx}" style="background:#1f2937; padding:10px; border-radius:4px; overflow-x:auto; max-height:300px; color:#f3f4f6; font-size:12px;">{resp_body}</pre>
-        <button onclick="copyDebugInfo('{idx}')" style="margin-top:8px; padding:6px 12px; background:#3b82f6; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:12px;">📋 一键复制</button></div></details></div>"""
+
+        card = f"""
+        <div style="background:#111827; border:1px solid #374151; border-radius:8px; padding:15px; margin-bottom:15px;">
+            <details>
+                <summary style="cursor:pointer; color:#60a5fa; font-weight:bold;">
+                    #{idx+1} | [{log_time}] ID: {req_id} | Status: {status_code} | Time: {time_cost}s
+                </summary>
+                <div style="margin-top:10px; color:#9ca3af; font-size:13px;">
+                    <p style="margin:4px 0;">• <b>请求模型:</b> {req_model}</p>
+                    <p style="margin:4px 0;">• <b>最终模型:</b> {final_model} (Key: ****{key_used})</p>
+                </div>
+                <div style="margin-top:10px;">
+                    <strong style="color:#60a5fa;">【Request Body】:</strong>
+                    <pre style="background:#1f2937; padding:10px; border-radius:4px; overflow-x:auto; max-height:300px; color:#f3f4f6; font-size:12px;">{req_body}</pre>
+                </div>
+                <div style="margin-top:10px;">
+                    <strong style="color:#34d399;">【Response Body】:</strong>
+                    <pre id="resp-body-{idx}" style="background:#1f2937; padding:10px; border-radius:4px; overflow-x:auto; max-height:300px; color:#f3f4f6; font-size:12px;">{resp_body}</pre>
+                    <button onclick="copyDebugInfo('{idx}')" style="margin-top:8px; padding:6px 12px; background:#3b82f6; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:12px;">📋 一键复制 AI 调试包</button>
+                </div>
+            </details>
+        </div>
+        """
         items_html.append(card)
+
     content = "".join(items_html) if items_html else "<p style='color:#9ca3af;'>暂无 Debug 日志记录</p>"
-    body_html = f"""{copy_script}<h2>🔍 全量 Debug 深度调试面板 <span class="tag">(最近 50 条)</span></h2><hr style="border-color:#1e293b; margin-bottom:15px;"/>{content}"""
+    body_html = f"""
+    {copy_script}
+    <h2>🔍 全量 Debug 深度调试面板 <span class="tag">(最近 50 条)</span></h2>
+    <hr style="border-color:#1e293b; margin-bottom:15px;"/>
+    {content}
+    """
     resp = HTMLResponse(content=html_page("Debug 深度调试", body_html))
     if CUSTOM_API_KEYS and password:
         resp.set_cookie(key="debug_auth_token", value=password, max_age=86400*7)
@@ -978,11 +1078,10 @@ async def config():
     body = f"""<h2>⚙️ 系统当前全局运行配置</h2>
 <pre style='background:#1f2937; color:#f3f4f6; padding:15px; border-radius:6px; border:1px solid #374151;'>
 网关核心版本: {VERSION}
+开源 GitHub: https://github.com/xyrct301/cerebras-proxy-re
 全局默认模型: {DEFAULT_MODEL}
-GLM模型映射: {GLM_MODEL}
-GPT模型映射: {GPT_MODEL}
-API-Key总计: {len(CEREBRAS_API_KEYS)} 个物理Key
-触发限流冷却: {KEY_COOLDOWN}秒
+Cerebras Key 总计: {len(CEREBRAS_API_KEYS)} 个
+Groq Key 总计: {len(groq_pool.keys)} 个
 思考强控制模式 (Thinking): {THINKING_MODE.upper()}
 模型自动降级模式 (Fallback): {MODEL_FALLBACK_MODE.upper()}
 Upstash 持久化状态: {'🟢 已启用' if UPSTASH_REDIS_REST_URL else '⚪ 本地JSON模式'}
@@ -994,14 +1093,14 @@ async def thinkingdisplay_page(mode: Optional[str] = None):
     global THINKING_MODE
     if mode in ["auto", "on", "off"]:
         THINKING_MODE = mode
+    
     body = f"""<h2>🎯 思考输出渲染控制面</h2>
 <p>当前强制策略状态: <strong style="color:#3b82f6;">{THINKING_MODE.upper()}</strong></p>
 <hr style="border-color:#1e293b;"/>
-<p>💡 <b>状态说明:</b><br/>- <b>AUTO:</b> 智能遵循客户端参数（未传默认关闭）。<br/>- <b>ON:</b> 强制完整保留并输出所有的思考推理字段。<br/>- <b>OFF:</b> 强制在上游屏蔽并在响应中彻底抹除推理内容（极速 + 节省 Token）。</p><br/>
 <ul style="list-style:none; padding:0;">
-<li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=auto" style="display:block; padding:10px; background:#1f2937; border-radius:6px; border:1px solid #374151;">🔄 切换至 AUTO</a></li>
-<li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=on" style="display:block; padding:10px; background:#065f46; color:#34d399; border-radius:6px;">🟢 切换至 ON</a></li>
-<li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=off" style="display:block; padding:10px; background:#991b1b; color:#f87171; border-radius:6px;">🔴 切换至 OFF (强烈推荐)</a></li>
+    <li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=auto" style="display:block; padding:10px; background:#1f2937; border-radius:6px; border:1px solid #374151;">🔄 切换至 AUTO</a></li>
+    <li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=on" style="display:block; padding:10px; background:#065f46; color:#34d399; border-radius:6px;">🟢 切换至 ON</a></li>
+    <li style="margin-bottom:10px;"><a href="/thinkingdisplay?mode=off" style="display:block; padding:10px; background:#991b1b; color:#f87171; border-radius:6px;">🔴 切换至 OFF (游戏推荐)</a></li>
 </ul>"""
     return HTMLResponse(content=html_page("Thinking Control", body))
 
@@ -1010,13 +1109,26 @@ async def fallbackmode_page(mode: Optional[str] = None):
     global MODEL_FALLBACK_MODE
     if mode in ["auto", "off", "force_gpt"]:
         MODEL_FALLBACK_MODE = mode
-    body = f"""<h2>🔀 模型降级策略控制面 (GLM -> GPT)</h2>
+    
+    body = f"""<h2>🔀 模型降级策略控制面</h2>
 <p>当前策略状态: <strong style="color:#eab308;">{MODEL_FALLBACK_MODE.upper()}</strong></p>
 <hr style="border-color:#1e293b;"/>
-<p>💡 <b>状态说明:</b><br/>- <b>AUTO:</b> 智能自动降级。当 GLM 出现 429/5xx 错误时，无缝切换至 GPT 接管。<br/>- <b>OFF:</b> 严禁降级。严格只使用 GLM 模型，报错直接返回给客户端。<br/>- <b>FORCE_GPT:</b> 应急切流。所有请求直接强制切流至 GPT 处理。</p><br/>
 <ul style="list-style:none; padding:0;">
-<li style="margin-bottom:10px;"><a href="/fallbackmode?mode=auto" style="display:block; padding:10px; background:#1f2937; border-radius:6px; border:1px solid #374151;">🔄 切换至 AUTO (默认)</a></li>
-<li style="margin-bottom:10px;"><a href="/fallbackmode?mode=off" style="display:block; padding:10px; background:#991b1b; color:#f87171; border-radius:6px;">🔴 切换至 OFF (禁止降级)</a></li>
-<li style="margin-bottom:10px;"><a href="/fallbackmode?mode=force_gpt" style="display:block; padding:10px; background:#1e3a8a; color:#60a5fa; border-radius:6px;">⚡ 切换至 FORCE_GPT (强切GPT)</a></li>
+    <li style="margin-bottom:10px;"><a href="/fallbackmode?mode=auto" style="display:block; padding:10px; background:#1f2937; border-radius:6px; border:1px solid #374151;">🔄 切换至 AUTO (多级降级)</a></li>
+    <li style="margin-bottom:10px;"><a href="/fallbackmode?mode=off" style="display:block; padding:10px; background:#991b1b; color:#f87171; border-radius:6px;">🔴 切换至 OFF (禁止降级)</a></li>
 </ul>"""
     return HTMLResponse(content=html_page("Fallback Control", body))
+
+@app.get("/v1/models")
+async def models():
+    models_list = [{"id": m, "object": "model"} for m in CEREBRAS_MODELS + GROQ_MODELS]
+    return JSONResponse(content={"object": "list", "data": models_list})
+
+@app.get("/health")
+async def health():
+    return JSONResponse(content={
+        "status": "ok", 
+        "version": VERSION, 
+        "cerebras_keys": len(CEREBRAS_API_KEYS),
+        "groq_keys": len(groq_pool.keys)
+    })

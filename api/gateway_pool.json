@@ -1,0 +1,42 @@
+{
+    "csk-6trd4dwt5njj8xcht8vxrxcp6jjfjk8f2p6jwjcjxpynfk45": {
+        "gemma-4-31b": {
+            "requests": 0,
+            "tokens": 0,
+            "tpd_tokens": 0,
+            "last_reset_date": "2026-07-28"
+        },
+        "zai-glm-4.7": {
+            "requests": 16,
+            "tokens": 200098,
+            "tpd_tokens": 192466,
+            "last_reset_date": "2026-07-28"
+        },
+        "gpt-oss-120b": {
+            "requests": 7,
+            "tokens": 135134,
+            "tpd_tokens": 134678,
+            "last_reset_date": "2026-07-28"
+        }
+    },
+    "csk-x9tkd4h9v46jhkjkfx4nej26rh683ff4ndht5chrt8pkwmed": {
+        "gemma-4-31b": {
+            "requests": 0,
+            "tokens": 0,
+            "tpd_tokens": 0,
+            "last_reset_date": "2026-07-28"
+        },
+        "zai-glm-4.7": {
+            "requests": 13,
+            "tokens": 168158,
+            "tpd_tokens": 164442,
+            "last_reset_date": "2026-07-28"
+        },
+        "gpt-oss-120b": {
+            "requests": 8,
+            "tokens": 121798,
+            "tpd_tokens": 121798,
+            "last_reset_date": "2026-07-28"
+        }
+    }
+}
