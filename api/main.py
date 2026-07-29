@@ -40,7 +40,7 @@ from agnes_provider import (
 )
 from access_control import ClientPrincipal, access_manager
 
-VERSION = "2.0.5-FastAPI"
+VERSION = "2.0.6-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 GEMMA_MODEL = "gemma-4-31b"
@@ -486,6 +486,7 @@ async def authorize_model_request(
     if not access_manager.authorize(principal, model):
         return None, api_error(403, f"Model not allowed: {model}", "permission_error", "model_not_allowed", request_id)
 
+    estimated_tokens = estimate_tokens(messages=body.get("messages", [])) if body and body.get("messages") else 0
     quota = await access_manager.consume(
         principal,
         model,
@@ -493,12 +494,16 @@ async def authorize_model_request(
         client=async_client,
         redis_url=UPSTASH_REDIS_REST_URL,
         redis_token=UPSTASH_REDIS_REST_TOKEN,
+        estimated_tokens=estimated_tokens,
     )
     if not quota["allowed"]:
-        response = api_error(429, "Client RPM limit exceeded", "rate_limit_error", "client_rpm_exceeded", request_id)
+        response = api_error(429, "Client provider quota exceeded", "rate_limit_error", "client_quota_exceeded", request_id)
         response.headers["Retry-After"] = str(quota["retry_after"])
         response.headers["X-RateLimit-Limit-Requests"] = str(quota["limit_rpm"])
         response.headers["X-RateLimit-Remaining-Requests"] = "0"
+        if quota.get("limit_tpm") is not None:
+            response.headers["X-RateLimit-Limit-Tokens"] = str(quota["limit_tpm"])
+            response.headers["X-RateLimit-Remaining-Tokens"] = "0"
         return None, response
     return principal, None
 
@@ -606,6 +611,43 @@ async def finish_log_async(request_id: str, request_model: str, key: str, final_
     }
     await add_log_async(item)
 
+async def record_client_completion_async(principal: ClientPrincipal, model: str, usage: dict, body: dict):
+    await access_manager.record_tokens(
+        principal, model, int((usage or {}).get("completion_tokens", 0)), body=body,
+        client=async_client, redis_url=UPSTASH_REDIS_REST_URL,
+        redis_token=UPSTASH_REDIS_REST_TOKEN,
+    )
+
+async def tracked_external_stream(source, principal: ClientPrincipal, model: str, body: dict):
+    usage = None
+    generated_text = ""
+    try:
+        async for chunk in source:
+            text = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else str(chunk)
+            for line in text.splitlines():
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+                try:
+                    data = json.loads(payload)
+                    if data.get("usage"):
+                        usage = data["usage"]
+                    for choice in data.get("choices", []):
+                        content = choice.get("delta", {}).get("content")
+                        if content:
+                            generated_text += content
+                except Exception:
+                    pass
+            yield chunk
+    finally:
+        if not usage:
+            completion_tokens = estimate_tokens(text_content=generated_text)
+            usage = {"prompt_tokens": 0, "completion_tokens": completion_tokens, "total_tokens": completion_tokens}
+        await add_global_usage_async(model, usage)
+        await record_client_completion_async(principal, model, usage, body)
+
 @app.post("/v1/chat/completions")
 async def chat(request: Request):
     start = time.time()
@@ -618,6 +660,8 @@ async def chat(request: Request):
         raw = {}
 
     request_model = raw.get("model", DEFAULT_MODEL)
+    if request_model not in CEREBRAS_MODELS and request_model not in GROQ_MODELS and request_model not in AGNES_MODELS:
+        return api_error(400, f"Unsupported model: {request_model}", "invalid_request_error", "unsupported_model", request_id)
     principal, auth_error = await authorize_model_request(request, request_model, request_id, raw)
     if auth_error:
         return auth_error
@@ -625,9 +669,6 @@ async def chat(request: Request):
     async with stats_lock:
         GLOBAL_STATS["total_requests"] += 1
     await save_global_stats_async()
-
-    if request_model not in CEREBRAS_MODELS and request_model not in GROQ_MODELS and request_model not in AGNES_MODELS:
-        return api_error(400, f"Unsupported model: {request_model}", "invalid_request_error", "unsupported_model", request_id)
 
     show_thinking = final_thinking(raw)
 
@@ -647,7 +688,8 @@ async def chat(request: Request):
         if raw.get("stream", False):
             async def agnes_stream_gen():
                 try:
-                    async for chunk in sanitize_agnes_sse_stream(agnes_resp, request_model, request_id):
+                    source = sanitize_agnes_sse_stream(agnes_resp, request_model, request_id)
+                    async for chunk in tracked_external_stream(source, principal, request_model, raw):
                         yield chunk
                 finally:
                     await agnes_resp.aclose()
@@ -659,6 +701,7 @@ async def chat(request: Request):
             result = sanitize_agnes_response(agnes_resp.json(), request_model, request_id)
             usage = result.get("usage", {})
             await add_global_usage_async(request_model, usage)
+            await record_client_completion_async(principal, request_model, usage, raw)
             await finish_log_async(request_id, request_model, agnes_candidate.key, f"agnes:{agnes_candidate.site}", False, start, usage)
             return JSONResponse(status_code=agnes_resp.status_code, content=result)
         finally:
@@ -671,7 +714,8 @@ async def chat(request: Request):
             if raw.get("stream", False):
                 async def direct_groq_stream_gen():
                     try:
-                        async for chunk in sanitize_sse_stream(groq_resp, request_id=request_id, model=groq_model):
+                        source = sanitize_sse_stream(groq_resp, request_id=request_id, model=groq_model)
+                        async for chunk in tracked_external_stream(source, principal, groq_model, raw):
                             yield chunk
                     finally:
                         await groq_resp.aclose()
@@ -686,6 +730,7 @@ async def chat(request: Request):
                 usage = res_data.get("usage", {})
                 total_tokens = usage.get("total_tokens", 0)
                 await add_global_usage_async(groq_model, usage)
+                await record_client_completion_async(principal, groq_model, usage, raw)
                 await groq_pool.record_success(groq_key, groq_model, total_tokens)
                 await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
                 await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", False, start, usage)
@@ -825,6 +870,7 @@ async def chat(request: Request):
                                 last_usage = {"prompt_tokens": estimated_in, "completion_tokens": out_tokens, "total_tokens": estimated_in + out_tokens}
 
                             await add_global_usage_async(selected_model, last_usage)
+                            await record_client_completion_async(principal, selected_model, last_usage, raw)
                             await pool.sync_headers_async(selected_key, selected_model, response.headers, actual_tokens=last_usage.get("total_tokens", 0))
 
                             if fallback_happened:
@@ -882,6 +928,7 @@ async def chat(request: Request):
                         result["usage"] = usage
 
                     await add_global_usage_async(selected_model, usage)
+                    await record_client_completion_async(principal, selected_model, usage, raw)
                     await pool.sync_headers_async(selected_key, selected_model, r.headers, actual_tokens=usage.get("total_tokens", 0))
 
                     if not show_thinking:
@@ -924,6 +971,15 @@ async def chat(request: Request):
     allowed_groq_models = [model for model in GROQ_MODELS if access_manager.authorize(principal, model)]
     groq_resp, groq_model, groq_key = (None, None, None)
     if MODEL_FALLBACK_MODE == "auto":
+        if allowed_groq_models and access_manager.provider_for_model(request_model) != "groq":
+            fallback_quota = await access_manager.consume(
+                principal, allowed_groq_models[0], body=raw,
+                client=async_client, redis_url=UPSTASH_REDIS_REST_URL,
+                redis_token=UPSTASH_REDIS_REST_TOKEN,
+                estimated_tokens=estimate_tokens(messages=raw.get("messages", [])),
+            )
+            if not fallback_quota["allowed"]:
+                return api_error(429, "Groq client quota exceeded", "rate_limit_error", "client_quota_exceeded", request_id)
         for fallback_model in allowed_groq_models:
             groq_raw = dict(raw)
             groq_raw["model"] = fallback_model
@@ -940,7 +996,8 @@ async def chat(request: Request):
         if raw.get("stream", False):
             async def groq_stream_gen():
                 try:
-                    async for chunk in sanitize_sse_stream(groq_resp, request_id=request_id, model=groq_model):
+                    source = sanitize_sse_stream(groq_resp, request_id=request_id, model=groq_model)
+                    async for chunk in tracked_external_stream(source, principal, groq_model, raw):
                         yield chunk
                 finally:
                     await groq_resp.aclose()
@@ -955,6 +1012,7 @@ async def chat(request: Request):
                 usage = res_data.get("usage", {})
                 tot_tok = usage.get("total_tokens", 0)
                 await add_global_usage_async(groq_model, usage)
+                await record_client_completion_async(principal, groq_model, usage, raw)
                 await groq_pool.record_success(groq_key, groq_model, tot_tok)
                 await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
                 await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", True, start, usage)
@@ -1478,17 +1536,28 @@ async def admin_page(request: Request):
             action = str(form.get("action", ""))
             if action == "create":
                 allowed_models = [m.strip() for m in str(form.get("allowed_models", "")).split(",") if m.strip()]
-                created = await access_manager.create({
-                    "name": str(form.get("name", "")),
-                    "scope": str(form.get("scope", "all")),
-                    "contributions": str(form.get("contributions", "1")),
-                    "allowed_models": allowed_models or None,
-                    "enabled": True,
-                }, upstash_set_async)
+                try:
+                    providers = {
+                        "cerebras": max(0, int(form.get("cerebras_contributions", 0))),
+                        "groq": max(0, int(form.get("groq_contributions", 0))),
+                        "agnes": max(0, int(form.get("agnes_contributions", 0))),
+                    }
+                except (TypeError, ValueError):
+                    providers = {"cerebras": 0, "groq": 0, "agnes": 0}
+                created = None
+                if any(value > 0 for value in providers.values()):
+                    created = await access_manager.create({
+                        "name": str(form.get("name", "")),
+                        "providers": providers,
+                        "allowed_models": allowed_models or None,
+                        "enabled": True,
+                    }, upstash_set_async)
+                else:
+                    message = "至少需要为一个服务商设置贡献数量"
                 if created:
                     generated_key = created["key"]
                     message = "Key 创建成功，仅在本页显示一次"
-                else:
+                elif not message:
                     message = "Key 创建失败"
             elif action == "toggle":
                 ok = await access_manager.update_by_client_id(
@@ -1497,6 +1566,24 @@ async def admin_page(request: Request):
                     upstash_set_async,
                 )
                 message = "状态已更新" if ok else "状态更新失败"
+            elif action == "update":
+                try:
+                    providers = {
+                        "cerebras": max(0, int(form.get("cerebras_contributions", 0))),
+                        "groq": max(0, int(form.get("groq_contributions", 0))),
+                        "agnes": max(0, int(form.get("agnes_contributions", 0))),
+                    }
+                except (TypeError, ValueError):
+                    providers = {"cerebras": 0, "groq": 0, "agnes": 0}
+                allowed_models = [m.strip() for m in str(form.get("allowed_models", "")).split(",") if m.strip()]
+                ok = False
+                if any(value > 0 for value in providers.values()):
+                    ok = await access_manager.update_by_client_id(
+                        str(form.get("client_id", "")),
+                        {"name": str(form.get("name", "")), "providers": providers, "allowed_models": allowed_models or None},
+                        upstash_set_async,
+                    )
+                message = "配置已更新" if ok else "配置更新失败，至少需要启用一个服务商"
             elif action == "delete":
                 ok = await access_manager.delete_by_client_id(str(form.get("client_id", "")), upstash_set_async)
                 message = "Key 已删除或禁用" if ok else "删除失败"
@@ -1506,13 +1593,17 @@ async def admin_page(request: Request):
     csrf = admin_session_token()
     for item in clients:
         models = ", ".join(item["allowed_models"] or ["全部允许范围内模型"])
+        providers = item["providers"]
+        form_id = f"edit-{item['client_id']}"
         next_enabled = "false" if item["enabled"] else "true"
         rows.append(f"""
         <tr>
-            <td>{html_lib.escape(item['name'] or '-')}</td><td>{html_lib.escape(item['scope'])}</td>
-            <td>{item['contributions']}</td><td>****{html_lib.escape(item['key_suffix'])}</td>
-            <td>{html_lib.escape(models)}</td><td>{'启用' if item['enabled'] else '禁用'}</td>
+            <td><input form="{form_id}" name="name" value="{html_lib.escape(item['name'] or '')}" style="width:120px;"/></td>
+            <td style="white-space:nowrap;">C <input form="{form_id}" name="cerebras_contributions" type="number" min="0" max="100" value="{providers.get('cerebras', 0)}" style="width:48px;"/> G <input form="{form_id}" name="groq_contributions" type="number" min="0" max="100" value="{providers.get('groq', 0)}" style="width:48px;"/> A <input form="{form_id}" name="agnes_contributions" type="number" min="0" max="100" value="{providers.get('agnes', 0)}" style="width:48px;"/></td>
+            <td>****{html_lib.escape(item['key_suffix'])}</td>
+            <td><input form="{form_id}" name="allowed_models" value="{html_lib.escape(', '.join(item['allowed_models'] or []))}" placeholder="留空表示全部" style="min-width:240px;"/></td><td>{'启用' if item['enabled'] else '禁用'}</td>
             <td style="white-space:nowrap;">
+                <form id="{form_id}" method="POST"><input type="hidden" name="csrf" value="{csrf}"/><input type="hidden" name="action" value="update"/><input type="hidden" name="client_id" value="{item['client_id']}"/></form><button type="submit" form="{form_id}">保存</button>
                 <form method="POST" style="display:inline;"><input type="hidden" name="csrf" value="{csrf}"/><input type="hidden" name="action" value="toggle"/><input type="hidden" name="client_id" value="{item['client_id']}"/><input type="hidden" name="enabled" value="{next_enabled}"/><button type="submit">{'禁用' if item['enabled'] else '启用'}</button></form>
                 <form method="POST" style="display:inline;"><input type="hidden" name="csrf" value="{csrf}"/><input type="hidden" name="action" value="delete"/><input type="hidden" name="client_id" value="{item['client_id']}"/><button type="submit">删除</button></form>
             </td>
@@ -1527,15 +1618,16 @@ async def admin_page(request: Request):
     <form method="POST" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;">
         <input type="hidden" name="csrf" value="{csrf}"/><input type="hidden" name="action" value="create"/>
         <input name="name" placeholder="名称/备注" required/>
-        <select name="scope"><option value="all">通用 all</option><option value="agnes">仅 Agnes</option></select>
-        <input name="contributions" type="number" min="1" max="100" value="1" required/>
+        <input name="cerebras_contributions" type="number" min="0" max="100" value="0" placeholder="Cerebras 贡献 Key 数" required/>
+        <input name="groq_contributions" type="number" min="0" max="100" value="0" placeholder="Groq 贡献 Key 数" required/>
+        <input name="agnes_contributions" type="number" min="0" max="100" value="0" placeholder="Agnes 贡献池数" required/>
         <input name="allowed_models" placeholder="允许模型，逗号分隔；留空表示范围内全部"/>
         <button type="submit">生成 Key</button>
     </form>
     <h3 style="margin-top:20px;">现有 Key</h3>
     <div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;">
-    <tr><th>名称</th><th>范围</th><th>贡献数</th><th>Key</th><th>允许模型</th><th>状态</th><th>操作</th></tr>
-    {''.join(rows) if rows else '<tr><td colspan="7">暂无 Key</td></tr>'}
+    <tr><th>名称</th><th>服务商贡献</th><th>Key</th><th>允许模型</th><th>状态</th><th>操作</th></tr>
+    {''.join(rows) if rows else '<tr><td colspan="6">暂无 Key</td></tr>'}
     </table></div>"""
     return HTMLResponse(content=html_page("Admin", body))
 

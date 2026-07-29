@@ -1,4 +1,4 @@
-# Cerebras OpenAI API Gateway 2.0.5
+# Cerebras OpenAI API Gateway 2.0.6
 
 > 聚合 Cerebras、Groq 和 Agnes 的 OpenAI 兼容网关，支持多 Key 轮询、模型权限和贡献额度管理。
 
@@ -18,8 +18,8 @@
 - **智能模型自动降级 (Fallback System)**：当上游 GLM 模型 (`zai-glm-4.7`) 发生限流或异常时，可无缝无感自动降级至 GPT 模型 (`gpt-oss-120b`) 接管响应。
 - **Groq 兼容降级 (Groq Fallback)**：Cerebras 全部失败后，自动切换到 Groq 托管模型，继续提供 OpenAI 兼容响应。
 - **Agnes 双站轮询**：中国站和国际站分别配置物理 Key，按“站点 + Key”候选节点轮询，支持文本、图片和异步视频接口。
-- **客户端 Key 权限**：支持通用 Key、仅 Agnes Key 和精确模型白名单；`/v1/models` 只返回当前 Key 有权调用的模型。
-- **贡献额度**：每个客户端 Key 独立计算 Agnes RPM，公式为 `官方实际 RPM × 贡献数量 × 2`，Vercel 环境可通过 Upstash 原子计数。
+- **客户端 Key 权限**：每个 Key 分别配置 Cerebras、Groq、Agnes 的贡献数量，数量为 `0` 的服务商不可访问；还可设置精确模型白名单。
+- **贡献额度**：每个客户端 Key、每个服务商独立计算 RPM/TPM，公式为 `官方基准额度 × 对应服务商贡献数量 × 2`。
 - **思考过程深度控制 (Thinking Control)**：支持 `AUTO` / `ON` / `OFF` 三档控制，可一键全局强行抹除思考推理过程，极致节省 Token 消耗与响应耗时。
 - **可视化监控与深度调试**：提供极简黑夜风格看板，实时查看所有 Key 的 RPM/RPD/TPM/TPD 水位线、最近 100 条请求历史，以及支持同时打包 Request 与 Response 的一键调试包复制。
 - **OpenCode / Cursor 兼容**：补齐 OpenAI 标准模型列表与流式字段，便于编辑器直接识别并接入。
@@ -64,7 +64,7 @@
 | `AGNES_CN_API_KEYS` | 否 | - | Agnes 中国站 Key，固定用于 `api.agnes-ai.cn`，多个用逗号分隔 |
 | `AGNES_INTL_API_KEYS` | 否 | - | Agnes 国际站 Key，固定用于 `apihub.agnes-ai.com`，多个用逗号分隔 |
 | `CUSTOM_API_KEYS` | 否 | - | 旧版通用客户端 Key，贡献数量固定为 1 |
-| `GATEWAY_KEYS_JSON` | 否 | - | 客户端 Key 结构化初始配置，可设置范围、模型白名单和贡献数量 |
+| `GATEWAY_KEYS_JSON` | 否 | - | 客户端 Key 结构化初始配置，可分别设置各服务商贡献数量和模型白名单 |
 | `ADMIN_API_KEY` | 否 | - | `/admin` 独立管理员登录密钥 |
 | `UPSTASH_REDIS_REST_URL` | 否 | - | Upstash Redis REST URL（开启云端数据持久化） |
 | `UPSTASH_REDIS_REST_TOKEN` | 否 | - | Upstash Redis REST Token |
@@ -77,24 +77,35 @@
 {
   "cpr_all_c1_replace-with-random-secret": {
     "name": "通用用户",
-    "scope": "all",
-    "contributions": 1,
+    "providers": {
+      "cerebras": 1,
+      "groq": 1,
+      "agnes": 1
+    },
     "enabled": true
   },
-  "cpr_agnes_c2_replace-with-random-secret": {
-    "name": "Agnes 贡献者",
-    "scope": "agnes",
-    "contributions": 2,
+  "cpr_multi_c3_replace-with-random-secret": {
+    "name": "贡献者 A",
+    "providers": {
+      "cerebras": 2,
+      "groq": 1,
+      "agnes": 0
+    },
     "allowed_models": [
-      "agnes/agnes-2.5-flash",
-      "agnes/agnes-image-2.1-flash"
+      "gemma-4-31b",
+      "gpt-oss-120b",
+      "openai/gpt-oss-120b"
     ],
     "enabled": true
   }
 }
 ```
 
-Key 名称中的 `c2` 仅用于辨识，服务端实际额度始终读取配置中的 `contributions`。Admin 页面生成的动态 Key 需要 Upstash 持久化；未配置 Upstash 时 Admin 为只读模式。
+`providers` 中的数量同时表示服务商访问权限和贡献数量。`0` 表示禁止访问该服务商。服务端实际额度始终读取配置内容，不信任 Key 名称中的数字。Admin 页面生成的动态 Key 需要 Upstash 持久化；未配置 Upstash 时 Admin 为只读模式。
+
+例如贡献者 A 提供了 2 个 Cerebras Key 和 1 个 Groq Key，则配置为 `cerebras: 2`、`groq: 1`、`agnes: 0`。该客户端 Key 可以调用 Cerebras 和 Groq，但 `/v1/models` 不会返回 Agnes 模型，直接请求 Agnes 也会返回 `403 model_not_allowed`。
+
+客户端独立额度基准：Cerebras 为 `5 RPM / 30,000 TPM`，Groq 沿用项目基准 `30 RPM / 40,000 TPM`，Agnes 使用官方按模型/图片分辨率公布的 RPM 且不虚构 TPM。最终额度按对应服务商贡献数量乘以 2。
 
 Agnes 免费/default 官方实际 RPM：文本 20；图片 1K/2K/3K/4K 分别为 20/10/1/1；视频为 1。中国站和国际站分别作为独立限制池，同一站点配置多个 API Key 不会叠加官方 RPM。
 

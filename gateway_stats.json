@@ -1,0 +1,83 @@
+{
+    "total_requests": 1,
+    "fallback_count": 0,
+    "groq_fallback_count": 0,
+    "agnes_requests": 0,
+    "429_count": 0,
+    "truncated_count": 0,
+    "other_models_count": 0,
+    "models": {
+        "gemma-4-31b": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "zai-glm-4.7": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "gpt-oss-120b": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "llama-3.3-70b-versatile": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "llama-3.1-8b-instant": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "openai/gpt-oss-120b": {
+            "requests": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "tokens": 2
+        },
+        "openai/gpt-oss-20b": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "openai/gpt-oss-safeguard-20b": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "qwen/qwen3.6-27b": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "agnes/agnes-2.5-flash": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "agnes/agnes-image-2.1-flash": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "agnes/agnes-video-v2.0": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        }
+    }
+}
