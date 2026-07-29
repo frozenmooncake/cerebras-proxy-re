@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response, HTTPException, Depends, Form, Cookie
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from dotenv import load_dotenv
 
@@ -18,7 +19,7 @@ load_dotenv()
 
 from groq_provider import execute_groq_request, sanitize_groq_response, sanitize_sse_stream, GROQ_MODELS, groq_pool
 
-VERSION = "2.0.3-FastAPI"
+VERSION = "2.0.4-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 GEMMA_MODEL = "gemma-4-31b"
@@ -350,6 +351,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Cerebras OpenAI Gateway", version=VERSION, lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 def sse(data: Any) -> str:
     if isinstance(data, dict):
         data = json.dumps(data, ensure_ascii=False)
@@ -550,7 +559,7 @@ async def chat(request: Request):
             if raw.get("stream", False):
                 async def direct_groq_stream_gen():
                     try:
-                        async for chunk in sanitize_sse_stream(groq_resp):
+                        async for chunk in sanitize_sse_stream(groq_resp, request_id=request_id, model=groq_model):
                             yield chunk
                     finally:
                         await groq_resp.aclose()
@@ -657,6 +666,15 @@ async def chat(request: Request):
 
                                 try:
                                     obj = json.loads(data_body)
+                                    if "id" not in obj:
+                                        obj["id"] = f"chatcmpl-{request_id}"
+                                    if "object" not in obj:
+                                        obj["object"] = "chat.completion.chunk"
+                                    if "created" not in obj:
+                                        obj["created"] = int(time.time())
+                                    if "model" not in obj:
+                                        obj["model"] = selected_model
+
                                     if "usage" in obj and obj["usage"]:
                                         last_usage = obj["usage"]
 
@@ -795,7 +813,7 @@ async def chat(request: Request):
         if raw.get("stream", False):
             async def groq_stream_gen():
                 try:
-                    async for chunk in sanitize_sse_stream(groq_resp):
+                    async for chunk in sanitize_sse_stream(groq_resp, request_id=request_id, model=groq_model):
                         yield chunk
                 finally:
                     await groq_resp.aclose()
@@ -1173,7 +1191,13 @@ async def fallbackmode_page(mode: Optional[str] = None):
 
 @app.get("/v1/models")
 async def models():
-    models_list = [{"id": m, "object": "model"} for m in CEREBRAS_MODELS + GROQ_MODELS]
+    models_list = [
+        {"id": m, "object": "model", "created": 1700000000, "owned_by": "cerebras"}
+        for m in CEREBRAS_MODELS
+    ] + [
+        {"id": m, "object": "model", "created": 1700000000, "owned_by": "groq"}
+        for m in GROQ_MODELS
+    ]
     return JSONResponse(content={"object": "list", "data": models_list})
 
 @app.get("/health")

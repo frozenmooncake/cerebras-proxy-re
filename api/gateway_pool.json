@@ -14,8 +14,8 @@
         },
         "gpt-oss-120b": {
             "requests": 7,
-            "tokens": 135134,
-            "tpd_tokens": 0,
+            "tokens": 135585,
+            "tpd_tokens": 451,
             "last_reset_date": "2026-07-29"
         }
     },

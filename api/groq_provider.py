@@ -231,7 +231,7 @@ def sanitize_groq_body(raw_body: dict, show_thinking: bool, target_model: str) -
 
     return body
 
-async def sanitize_sse_stream(response: httpx.Response) -> AsyncGenerator[bytes, None]:
+async def sanitize_sse_stream(response: httpx.Response, request_id: str = "", model: str = "") -> AsyncGenerator[bytes, None]:
     """
     关键修复：拦截 SSE 流中的 finish_reason，如果为 'other' 或非法值，替换为 'stop'
     彻底消除 Cherry Studio / Vercel AI SDK 的 AI_FinishReasonError 报错
@@ -250,6 +250,19 @@ async def sanitize_sse_stream(response: httpx.Response) -> AsyncGenerator[bytes,
             try:
                 chunk = json.loads(data_str)
                 modified = False
+                if "id" not in chunk:
+                    chunk["id"] = f"chatcmpl-{request_id or int(time.time())}"
+                    modified = True
+                if "object" not in chunk:
+                    chunk["object"] = "chat.completion.chunk"
+                    modified = True
+                if "created" not in chunk:
+                    chunk["created"] = int(time.time())
+                    modified = True
+                if model and "model" not in chunk:
+                    chunk["model"] = model
+                    modified = True
+
                 if "choices" in chunk and isinstance(chunk["choices"], list):
                     for choice in chunk["choices"]:
                         reason = choice.get("finish_reason")

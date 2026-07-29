@@ -1,5 +1,5 @@
 {
-    "total_requests": 355,
+    "total_requests": 357,
     "fallback_count": 21,
     "groq_fallback_count": 0,
     "429_count": 31,
@@ -13,10 +13,10 @@
             "tokens": 384710
         },
         "gpt-oss-120b": {
-            "requests": 70,
-            "input_tokens": 245498,
-            "output_tokens": 40318,
-            "tokens": 285816
+            "requests": 72,
+            "input_tokens": 247995,
+            "output_tokens": 40546,
+            "tokens": 288541
         }
     }
 }
