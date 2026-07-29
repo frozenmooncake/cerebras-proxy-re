@@ -1,16 +1,16 @@
 {
-    "total_requests": 350,
-    "fallback_count": 20,
+    "total_requests": 355,
+    "fallback_count": 21,
     "groq_fallback_count": 0,
     "429_count": 31,
     "truncated_count": 0,
     "other_models_count": 3,
     "models": {
         "zai-glm-4.7": {
-            "requests": 95,
-            "input_tokens": 358253,
-            "output_tokens": 21736,
-            "tokens": 377879
+            "requests": 97,
+            "input_tokens": 364470,
+            "output_tokens": 22350,
+            "tokens": 384710
         },
         "gpt-oss-120b": {
             "requests": 70,

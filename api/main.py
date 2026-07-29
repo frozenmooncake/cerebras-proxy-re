@@ -14,7 +14,9 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import httpx
 from dotenv import load_dotenv
 
-from groq_provider import execute_groq_request, sanitize_sse_stream, GROQ_MODELS, groq_pool
+load_dotenv()
+
+from groq_provider import execute_groq_request, sanitize_groq_response, sanitize_sse_stream, GROQ_MODELS, groq_pool
 
 VERSION = "2.0.3-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
@@ -539,8 +541,52 @@ async def chat(request: Request):
         except Exception as e:
             return JSONResponse(status_code=500, content={"error": {"message": str(e)}})
 
-    # 4. 尝试 Cerebras 模型池轮询
     show_thinking = final_thinking(raw)
+
+    if request_model in GROQ_MODELS:
+        groq_resp, groq_model, groq_key = await execute_groq_request(async_client, raw, show_thinking)
+
+        if groq_resp and groq_model and groq_key:
+            if raw.get("stream", False):
+                async def direct_groq_stream_gen():
+                    try:
+                        async for chunk in sanitize_sse_stream(groq_resp):
+                            yield chunk
+                    finally:
+                        await groq_resp.aclose()
+                        await groq_pool.record_success(groq_key, groq_model)
+                        await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
+                        await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", False, start)
+
+                return StreamingResponse(direct_groq_stream_gen(), media_type="text/event-stream")
+
+            try:
+                res_data = sanitize_groq_response(groq_resp.json())
+                usage = res_data.get("usage", {})
+                total_tokens = usage.get("total_tokens", 0)
+                await add_global_usage_async(groq_model, usage)
+                await groq_pool.record_success(groq_key, groq_model, total_tokens)
+                await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
+                await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", False, start, usage)
+
+                bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+                await add_debug_log_async({
+                    "id": request_id, "time": bj_time, "request_model": request_model,
+                    "final_model": f"groq:{groq_model}", "key": groq_key[-4:], "status_code": 200,
+                    "time_cost": round(time.time() - start, 2),
+                    "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
+                    "response_body": truncate_text(json.dumps(res_data, ensure_ascii=False, indent=2))
+                })
+                return JSONResponse(status_code=200, content=res_data)
+            finally:
+                await groq_resp.aclose()
+
+        return JSONResponse(status_code=503, content={
+            "error": {"message": "All Groq keys/models failed", "type": "service_unavailable", "param": None, "code": "groq_failed"},
+            "request_id": request_id
+        })
+
+    # 4. 尝试 Cerebras 模型池轮询
     models_to_try = [GEMMA_MODEL, GLM_MODEL, GPT_MODEL] if request_model not in CEREBRAS_MODELS else [request_model] + [m for m in CEREBRAS_MODELS if m != request_model]
     
     last_error = None
@@ -749,22 +795,22 @@ async def chat(request: Request):
         if raw.get("stream", False):
             async def groq_stream_gen():
                 try:
-                    async for chunk in groq_resp.aiter_bytes():
+                    async for chunk in sanitize_sse_stream(groq_resp):
                         yield chunk
                 finally:
                     await groq_resp.aclose()
-                    await groq_pool.record_success(groq_key)
+                    await groq_pool.record_success(groq_key, groq_model)
                     await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
                     await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", True, start)
 
             return StreamingResponse(groq_stream_gen(), media_type="text/event-stream")
         else:
             try:
-                res_data = groq_resp.json()
+                res_data = sanitize_groq_response(groq_resp.json())
                 usage = res_data.get("usage", {})
                 tot_tok = usage.get("total_tokens", 0)
                 await add_global_usage_async(groq_model, usage)
-                await groq_pool.record_success(groq_key, tot_tok)
+                await groq_pool.record_success(groq_key, groq_model, tot_tok)
                 await groq_pool.save_to_upstash(async_client, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN)
                 await finish_log_async(request_id, request_model, groq_key, f"groq:{groq_model}", True, start, usage)
 
@@ -903,6 +949,7 @@ async def status():
             <div class="tag">RPM (每分钟请求数)</div>{render_progress(g_lim['cur_rpm'], g_lim['rpm'])}
             <div class="tag">RPD (每日请求数)</div>{render_progress(g_lim['cur_rpd'], g_lim['rpd'])}
             <div class="tag">TPM (每分钟Tokens)</div>{render_progress(g_lim['cur_tpm'], g_lim['tpm'])}
+            <div class="tag">TPD (每日Tokens)</div>{render_progress(g_lim['cur_tpd'], g_lim['tpd'])}
         </div>
         """
     html += "</div>"
@@ -921,6 +968,7 @@ async def status():
             <div class="tag">RPM (每分钟请求数)</div>{render_progress(g_lim['cur_rpm'], g_lim['rpm'])}
             <div class="tag">RPD (每日请求数)</div>{render_progress(g_lim['cur_rpd'], g_lim['rpd'])}
             <div class="tag">TPM (每分钟Tokens)</div>{render_progress(g_lim['cur_tpm'], g_lim['tpm'])}
+            <div class="tag">TPD (每日Tokens)</div>{render_progress(g_lim['cur_tpd'], g_lim['tpd'])}
         </div>
         """
     html += "</div>"
@@ -944,6 +992,8 @@ async def status():
                 <div style="font-size:11px; color:#d1d5db; display:grid; grid-template-columns:1fr 1fr; gap:4px;">
                     <div>RPM: {metrics['current_rpm']}/{metrics['limit_rpm']}</div>
                     <div>RPD: {metrics['current_rpd']}/{metrics['limit_rpd']}</div>
+                    <div>TPM: {metrics['current_tpm']}/{metrics['limit_tpm']}</div>
+                    <div>TPD: {metrics['current_tpd']}/{metrics['limit_tpd']}</div>
                 </div>
             </div>
             """
@@ -970,6 +1020,8 @@ async def status():
                     <div style="font-size:11px; color:#d1d5db; display:grid; grid-template-columns:1fr 1fr; gap:4px;">
                         <div>RPM: {metrics['current_rpm']}/{metrics['limit_rpm']}</div>
                         <div>RPD: {metrics['current_rpd']}/{metrics['limit_rpd']}</div>
+                        <div>TPM: {metrics['current_tpm']}/{metrics['limit_tpm']}</div>
+                        <div>TPD: {metrics['current_tpd']}/{metrics['limit_tpd']}</div>
                     </div>
                 </div>
                 """

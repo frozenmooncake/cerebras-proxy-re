@@ -153,6 +153,21 @@ class AsyncGroqKeyPool:
             if estimated_tokens > 0:
                 info["token_timestamps"].append((now, estimated_tokens))
 
+    async def record_success(self, key: str, model: str, actual_tokens: int = 0):
+        if key not in self.data or model not in self.data[key]:
+            return
+
+        bj_now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        info = self.data[key][model]
+        info["cooldown"] = 0
+
+        if actual_tokens > 0:
+            if info.get("last_reset_date") != bj_now:
+                info["tpd_tokens"] = 0
+                info["last_reset_date"] = bj_now
+            info["tokens"] += actual_tokens
+            info["tpd_tokens"] += actual_tokens
+
     def sync_headers(self, key: str, model: str, headers: httpx.Headers, actual_tokens: int = 0):
         if not key or model not in GROQ_MODELS or key not in self.data:
             return
@@ -250,6 +265,19 @@ async def sanitize_sse_stream(response: httpx.Response) -> AsyncGenerator[bytes,
 
         yield (line + "\n\n").encode("utf-8")
 
+def sanitize_groq_response(data: dict) -> dict:
+    if not isinstance(data, dict):
+        return data
+
+    for choice in data.get("choices", []):
+        if not isinstance(choice, dict):
+            continue
+        reason = choice.get("finish_reason")
+        if reason and reason not in STANDARD_FINISH_REASONS:
+            choice["finish_reason"] = "stop"
+
+    return data
+
 async def execute_groq_request(
     client: httpx.AsyncClient, 
     raw_body: dict, 
@@ -294,11 +322,9 @@ async def execute_groq_request(
                 elif response.status_code == 429:
                     groq_pool.record_cooldown(key, target_model)
                     groq_pool.sync_headers(key, target_model, response.headers)
-                    if not groq_body.get("stream", False):
-                        await response.aclose()
+                    await response.aclose()
                 else:
-                    if not groq_body.get("stream", False):
-                        await response.aclose()
+                    await response.aclose()
             except Exception:
                 groq_pool.record_cooldown(key, target_model)
 
