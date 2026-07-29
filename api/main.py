@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import uuid
@@ -16,6 +17,9 @@ import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Vercel: 确保同目录模块可被 import
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from groq_provider import execute_groq_request, sanitize_groq_response, sanitize_sse_stream, GROQ_MODELS, groq_pool
 
