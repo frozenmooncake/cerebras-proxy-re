@@ -1572,13 +1572,25 @@ async def debug(request: Request):
 
     copy_script = """
     <script>
-    function copyDebugInfo(idx) {
-        const reqEl = document.getElementById('req-body-' + idx);
-        const respEl = document.getElementById('resp-body-' + idx);
-        const requestText = reqEl ? reqEl.innerText : '';
-        const responseText = respEl ? respEl.innerText : '';
-        const text = '【Request Body】\n' + requestText + '\n\n【Response Body】\n' + responseText;
-        navigator.clipboard.writeText(text).then(() => { alert('复制成功！'); }).catch(err => { alert('复制失败: ' + err); });
+    async function copyDebugInfo(idx) {
+        const packageEl = document.getElementById('debug-package-' + idx);
+        if (!packageEl) {
+            alert('复制失败: 找不到调试包');
+            return;
+        }
+        const text = packageEl.value;
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(text);
+            } else {
+                packageEl.focus();
+                packageEl.select();
+                if (!document.execCommand('copy')) throw new Error('浏览器拒绝复制');
+            }
+            alert('复制成功！');
+        } catch (err) {
+            alert('复制失败: ' + err);
+        }
     }
     </script>
     """
@@ -1596,8 +1608,21 @@ async def debug(request: Request):
         time_cost = item.get("time_cost", "N/A")
         log_time = item.get("time", "")
         
-        req_body = str(item.get("request_body", "")).replace("<", "&lt;").replace(">", "&gt;")
-        resp_body = str(item.get("response_body", "")).replace("<", "&lt;").replace(">", "&gt;")
+        raw_req_body = str(item.get("request_body", ""))
+        raw_resp_body = str(item.get("response_body", ""))
+        req_body = html_lib.escape(raw_req_body)
+        resp_body = html_lib.escape(raw_resp_body)
+        debug_package = f"""[{log_time}] ID: {req_id} | Status: {status_code} | Time: {time_cost}s
+• 请求模型: {req_model}
+
+• 最终模型: {final_model} (Key: ****{key_used})
+
+【Request Body】:
+{raw_req_body}
+
+【Response Body】:
+{raw_resp_body}"""
+        escaped_package = html_lib.escape(debug_package)
 
         card = f"""
         <div style="background:#111827; border:1px solid #374151; border-radius:8px; padding:15px; margin-bottom:15px;">
@@ -1616,7 +1641,8 @@ async def debug(request: Request):
                 <div style="margin-top:10px;">
                     <strong style="color:#34d399;">【Response Body】:</strong>
                     <pre id="resp-body-{idx}" style="background:#1f2937; padding:10px; border-radius:4px; overflow-x:auto; max-height:300px; color:#f3f4f6; font-size:12px;">{resp_body}</pre>
-                    <button onclick="copyDebugInfo('{idx}')" style="margin-top:8px; padding:6px 12px; background:#3b82f6; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:12px;">📋 一键复制 AI 调试包</button>
+                    <textarea id="debug-package-{idx}" readonly aria-hidden="true" style="position:fixed; left:-9999px; top:0; width:1px; height:1px;">{escaped_package}</textarea>
+                    <button type="button" onclick="copyDebugInfo('{idx}')" style="margin-top:8px; padding:6px 12px; background:#3b82f6; color:#fff; border:none; border-radius:4px; cursor:pointer; font-size:12px;">📋 一键复制 AI 调试包</button>
                 </div>
             </details>
         </div>

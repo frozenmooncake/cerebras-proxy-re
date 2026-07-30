@@ -76,8 +76,11 @@ class GatewaySecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("req-body-", response.text)
         self.assertIn("resp-body-", response.text)
+        self.assertIn("debug-package-", response.text)
         self.assertIn("【Request Body】", response.text)
         self.assertIn("【Response Body】", response.text)
+        self.assertIn("ID: copy-test", response.text)
+        self.assertIn("navigator.clipboard && window.isSecureContext", response.text)
 
 
 class CatalogAndAccessTests(unittest.TestCase):
