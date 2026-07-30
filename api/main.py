@@ -772,6 +772,23 @@ async def finish_log_async(request_id: str, request_model: str, key: str, final_
     }
     await add_log_async(item)
 
+async def add_chat_debug_async(
+    request_id: str, request_model: str, final_model: str, key_suffix: str,
+    status_code: int, start: float, raw: dict, response_body: str,
+):
+    bj_time = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+    await add_debug_log_async({
+        "id": request_id,
+        "time": bj_time,
+        "request_model": request_model,
+        "final_model": final_model,
+        "key": key_suffix,
+        "status_code": status_code,
+        "time_cost": round(time.time() - start, 2),
+        "request_body": truncate_text(json.dumps(raw, ensure_ascii=False, indent=2)),
+        "response_body": truncate_text(response_body),
+    })
+
 async def record_client_completion_async(principal: ClientPrincipal, model: str, usage: dict, body: dict):
     await access_manager.record_tokens(
         principal, model, int((usage or {}).get("completion_tokens", 0)), body=body,
@@ -829,15 +846,25 @@ async def chat(request: Request):
     if request_model in AGNES_MODELS:
         agnes_result = await agnes_adapter.chat(async_client, raw, timeout=120.0)
         if not agnes_result.available:
+            await add_chat_debug_async(
+                request_id, request_model, "agnes:none", "", 503, start, raw,
+                agnes_result.error or "Agnes unavailable",
+            )
             return api_error(503, agnes_result.error or "Agnes unavailable", "service_unavailable", "agnes_unavailable", request_id)
         if not 200 <= agnes_result.status_code < 300:
             try:
+                await add_chat_debug_async(
+                    request_id, request_model, f"agnes:{agnes_result.site}",
+                    agnes_result.credential_suffix, agnes_result.status_code, start,
+                    raw, agnes_result.response.text,
+                )
                 return upstream_response(agnes_result.response)
             finally:
                 await agnes_result.close()
 
         if raw.get("stream", False):
             async def agnes_stream_gen():
+                source = None
                 try:
                     source = agnes_result.stream(request_id)
                     async for chunk in tracked_external_stream(source, principal, request_model, raw):
@@ -845,6 +872,13 @@ async def chat(request: Request):
                 finally:
                     await agnes_result.close()
                     await finish_log_async(request_id, request_model, agnes_result.credential_suffix, f"agnes:{agnes_result.site}", False, start)
+                    generated = source.generated_text if source else ""
+                    samples = "".join(source.sample_chunks) if source else ""
+                    await add_chat_debug_async(
+                        request_id, request_model, f"agnes:{agnes_result.site}",
+                        agnes_result.credential_suffix, 200, start, raw,
+                        f"【流式输出】:\n{generated}\n\n【SSE Chunk 样例】:\n{samples}",
+                    )
 
             return StreamingResponse(agnes_stream_gen(), media_type="text/event-stream")
 
@@ -854,6 +888,11 @@ async def chat(request: Request):
             await add_global_usage_async(request_model, usage)
             await record_client_completion_async(principal, request_model, usage, raw)
             await finish_log_async(request_id, request_model, agnes_result.credential_suffix, f"agnes:{agnes_result.site}", False, start, usage)
+            await add_chat_debug_async(
+                request_id, request_model, f"agnes:{agnes_result.site}",
+                agnes_result.credential_suffix, agnes_result.status_code, start,
+                raw, json.dumps(result, ensure_ascii=False, indent=2),
+            )
             return JSONResponse(status_code=agnes_result.status_code, content=result)
         finally:
             await agnes_result.close()

@@ -7,12 +7,6 @@
     "truncated_count": 0,
     "other_models_count": 0,
     "models": {
-        "gemma-4-31b": {
-            "requests": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "tokens": 0
-        },
         "zai-glm-4.7": {
             "requests": 0,
             "input_tokens": 0,
@@ -20,6 +14,12 @@
             "tokens": 0
         },
         "gpt-oss-120b": {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
+        },
+        "gemma-4-31b": {
             "requests": 0,
             "input_tokens": 0,
             "output_tokens": 0,
@@ -38,10 +38,10 @@
             "tokens": 0
         },
         "openai/gpt-oss-120b": {
-            "requests": 1,
-            "input_tokens": 1,
-            "output_tokens": 1,
-            "tokens": 2
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens": 0
         },
         "openai/gpt-oss-20b": {
             "requests": 0,
@@ -62,10 +62,10 @@
             "tokens": 0
         },
         "agnes/agnes-2.5-flash": {
-            "requests": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "tokens": 0
+            "requests": 1,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "tokens": 2
         },
         "agnes/agnes-image-2.1-flash": {
             "requests": 0,

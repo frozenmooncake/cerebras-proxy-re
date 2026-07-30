@@ -243,6 +243,8 @@ agnes/agnes-2.5-flash
 
 Debug 页面的“一键复制 AI 调试包”会同时复制 `Request Body` 和 `Response Body`。
 
+Agnes 文本模型的流式、非流式和上游错误响应也会写入 `/debug`；流式记录包含生成正文和最多 10 条 SSE Chunk 样例。
+
 ---
 
 ## 测试

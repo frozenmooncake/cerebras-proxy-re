@@ -49,6 +49,7 @@ class ManagedStream:
         self.created = int(time.time())
         self.usage: Optional[Dict[str, Any]] = None
         self.generated_text = ""
+        self.sample_chunks = []
 
     def __aiter__(self) -> AsyncGenerator[bytes, None]:
         return self._iterate()
@@ -81,7 +82,10 @@ class ManagedStream:
                     content = choice.get("delta", {}).get("content")
                     if content:
                         self.generated_text += content
-                yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
+                output = "data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n"
+                if len(self.sample_chunks) < 10:
+                    self.sample_chunks.append(output)
+                yield output.encode("utf-8")
             except Exception:
                 yield (line + "\n\n").encode("utf-8")
 
