@@ -1,4 +1,4 @@
-# Cerebras OpenAI API Gateway 2.1.1
+# Cerebras OpenAI API Gateway 2.1.2
 
 > 聚合 Cerebras、Groq 和 Agnes 的 OpenAI 兼容网关，支持多 Key 轮询、模型权限和贡献额度管理。
 

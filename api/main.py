@@ -46,7 +46,7 @@ from provider_adapters import AgnesAdapter, GroqAdapter
 from access_control import ClientPrincipal, access_manager
 from distributed_limits import admit_fixed_window
 
-VERSION = "2.1.1-FastAPI"
+VERSION = "2.1.2-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 DEFAULT_MODEL = GPT_MODEL
@@ -300,6 +300,35 @@ def estimate_tokens(messages: list = None, text_content: str = "") -> int:
     if text_content:
         return len(encoding.encode(text_content))
     return 0
+
+def normalize_usage(usage: dict = None, messages: list = None, generated_text: str = "") -> dict:
+    usage = usage if isinstance(usage, dict) else {}
+
+    def token_count(*names: str) -> int:
+        for name in names:
+            try:
+                value = int(usage.get(name, 0))
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    prompt = token_count("prompt_tokens", "input_tokens")
+    completion = token_count("completion_tokens", "output_tokens")
+    total = token_count("total_tokens")
+    if prompt == 0:
+        prompt = estimate_tokens(messages=messages or [])
+    if completion == 0:
+        completion = estimate_tokens(text_content=generated_text)
+    if total == 0:
+        total = prompt + completion
+    return {
+        **usage,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+    }
 
 class AsyncKeyPool:
     def __init__(self, keys: list):
@@ -802,10 +831,8 @@ async def tracked_external_stream(source, principal: ClientPrincipal, model: str
             yield chunk
     finally:
         await source.response.aclose()
-        usage = source.usage
-        if not usage:
-            completion_tokens = estimate_tokens(text_content=source.generated_text)
-            usage = {"prompt_tokens": 0, "completion_tokens": completion_tokens, "total_tokens": completion_tokens}
+        usage = normalize_usage(source.usage, body.get("messages", []), source.generated_text)
+        source.usage = usage
         try:
             await asyncio.wait_for(add_global_usage_async(model, usage), timeout=5.0)
             await asyncio.wait_for(record_client_completion_async(principal, model, usage, body), timeout=5.0)
@@ -871,7 +898,8 @@ async def chat(request: Request):
                         yield chunk
                 finally:
                     await agnes_result.close()
-                    await finish_log_async(request_id, request_model, agnes_result.credential_suffix, f"agnes:{agnes_result.site}", False, start)
+                    usage = source.usage if source else None
+                    await finish_log_async(request_id, request_model, agnes_result.credential_suffix, f"agnes:{agnes_result.site}", False, start, usage)
                     generated = source.generated_text if source else ""
                     samples = "".join(source.sample_chunks) if source else ""
                     await add_chat_debug_async(
@@ -884,7 +912,13 @@ async def chat(request: Request):
 
         try:
             result = agnes_result.json(request_id)
-            usage = result.get("usage", {})
+            generated_text = "".join(
+                choice.get("message", {}).get("content", "")
+                for choice in result.get("choices", [])
+                if isinstance(choice, dict) and isinstance(choice.get("message", {}).get("content"), str)
+            )
+            usage = normalize_usage(result.get("usage"), raw.get("messages", []), generated_text)
+            result["usage"] = usage
             await add_global_usage_async(request_model, usage)
             await record_client_completion_async(principal, request_model, usage, raw)
             await finish_log_async(request_id, request_model, agnes_result.credential_suffix, f"agnes:{agnes_result.site}", False, start, usage)
@@ -903,20 +937,28 @@ async def chat(request: Request):
         if groq_result.available:
             if raw.get("stream", False):
                 async def direct_groq_stream_gen():
+                    source = None
                     try:
                         source = groq_result.stream(request_id)
                         async for chunk in tracked_external_stream(source, principal, groq_result.model, raw):
                             yield chunk
                     finally:
                         await groq_result.close()
-                        await groq_result.record_success()
-                        await finish_log_async(request_id, request_model, groq_result.credential_suffix, f"groq:{groq_result.model}", False, start)
+                        usage = source.usage if source else None
+                        await groq_result.record_success((usage or {}).get("total_tokens", 0))
+                        await finish_log_async(request_id, request_model, groq_result.credential_suffix, f"groq:{groq_result.model}", False, start, usage)
 
                 return StreamingResponse(direct_groq_stream_gen(), media_type="text/event-stream")
 
             try:
                 res_data = groq_result.json(request_id)
-                usage = res_data.get("usage", {})
+                generated_text = "".join(
+                    choice.get("message", {}).get("content", "")
+                    for choice in res_data.get("choices", [])
+                    if isinstance(choice, dict) and isinstance(choice.get("message", {}).get("content"), str)
+                )
+                usage = normalize_usage(res_data.get("usage"), raw.get("messages", []), generated_text)
+                res_data["usage"] = usage
                 total_tokens = usage.get("total_tokens", 0)
                 await add_global_usage_async(groq_result.model, usage)
                 await record_client_completion_async(principal, groq_result.model, usage, raw)
@@ -1191,20 +1233,28 @@ async def chat(request: Request):
 
         if raw.get("stream", False):
             async def groq_stream_gen():
+                source = None
                 try:
                     source = groq_result.stream(request_id)
                     async for chunk in tracked_external_stream(source, principal, groq_result.model, raw):
                         yield chunk
                 finally:
                     await groq_result.close()
-                    await groq_result.record_success()
-                    await finish_log_async(request_id, request_model, groq_result.credential_suffix, f"groq:{groq_result.model}", True, start)
+                    usage = source.usage if source else None
+                    await groq_result.record_success((usage or {}).get("total_tokens", 0))
+                    await finish_log_async(request_id, request_model, groq_result.credential_suffix, f"groq:{groq_result.model}", True, start, usage)
 
             return StreamingResponse(groq_stream_gen(), media_type="text/event-stream")
         else:
             try:
                 res_data = groq_result.json(request_id)
-                usage = res_data.get("usage", {})
+                generated_text = "".join(
+                    choice.get("message", {}).get("content", "")
+                    for choice in res_data.get("choices", [])
+                    if isinstance(choice, dict) and isinstance(choice.get("message", {}).get("content"), str)
+                )
+                usage = normalize_usage(res_data.get("usage"), raw.get("messages", []), generated_text)
+                res_data["usage"] = usage
                 tot_tok = usage.get("total_tokens", 0)
                 await add_global_usage_async(groq_result.model, usage)
                 await record_client_completion_async(principal, groq_result.model, usage, raw)
