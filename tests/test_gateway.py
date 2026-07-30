@@ -67,6 +67,18 @@ class GatewaySecurityTests(unittest.TestCase):
         asyncio.run(main.add_debug_log_async({"request_body": "secret", "response_body": "secret"}))
         self.assertEqual(main.DEBUG_LOGS[0]["request_body"], "[payload capture disabled]")
 
+    def test_debug_copy_package_contains_request_and_response(self):
+        self.admin_client()
+        asyncio.run(main.add_debug_log_async({
+            "id": "copy-test", "request_body": "request", "response_body": "response"
+        }))
+        response = self.client.get("/debug")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("req-body-", response.text)
+        self.assertIn("resp-body-", response.text)
+        self.assertIn("【Request Body】", response.text)
+        self.assertIn("【Response Body】", response.text)
+
 
 class CatalogAndAccessTests(unittest.TestCase):
     def setUp(self):
@@ -98,6 +110,55 @@ class CatalogAndAccessTests(unittest.TestCase):
             self.assertEqual(model_id, spec.public_id)
             self.assertIn(spec.provider, {"cerebras", "groq", "agnes"})
             self.assertIn(spec.operation, {"chat", "image", "video"})
+
+    def test_cerebras_panel_order_puts_gemma_last(self):
+        self.assertEqual(catalog.CEREBRAS_MODELS[-1], "gemma-4-31b")
+
+    def test_non_vision_model_rejects_image_content(self):
+        error = main.validate_chat_images(
+            "zai-glm-4.7",
+            [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}}]}],
+        )
+        self.assertEqual(error["code"], "image_input_not_supported")
+
+    def test_cloud_gateway_rejects_local_image_path(self):
+        error = main.validate_chat_images(
+            "gemma-4-31b",
+            [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": r"C:\\Users\\me\\a.jpg"}}]}],
+        )
+        self.assertEqual(error["code"], "local_image_unavailable")
+
+    def test_chat_endpoint_returns_clear_error_for_unsupported_image_model(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer contributor-a"},
+            json={
+                "model": "zai-glm-4.7",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": "https://example.com/a.jpg"}}],
+                }],
+                "stream": True,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "image_input_not_supported")
+
+    def test_chat_endpoint_returns_clear_error_for_local_image_path(self):
+        response = self.client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer contributor-a"},
+            json={
+                "model": "gemma-4-31b",
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": {"url": r"C:\\Users\\me\\a.jpg"}}],
+                }],
+                "stream": True,
+            },
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"]["code"], "local_image_unavailable")
 
     def test_contributor_provider_filtering(self):
         principal = asyncio.run(

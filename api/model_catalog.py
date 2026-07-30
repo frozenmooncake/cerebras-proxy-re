@@ -10,6 +10,7 @@ class ModelSpec:
     upstream_id: str
     base_rpm: int
     base_tpm: Optional[int] = None
+    supports_image_input: bool = False
 
 
 GEMMA_MODEL = "gemma-4-31b"
@@ -29,11 +30,14 @@ AGNES_TEXT_MODEL = "agnes/agnes-2.5-flash"
 AGNES_IMAGE_MODEL = "agnes/agnes-image-2.1-flash"
 AGNES_VIDEO_MODEL = "agnes/agnes-video-v2.0"
 
-CEREBRAS_MODELS = [GEMMA_MODEL, GLM_MODEL, GPT_MODEL]
+CEREBRAS_MODELS = [GLM_MODEL, GPT_MODEL, GEMMA_MODEL]
 AGNES_MODELS = [AGNES_TEXT_MODEL, AGNES_IMAGE_MODEL, AGNES_VIDEO_MODEL]
 
 MODEL_CATALOG: Dict[str, ModelSpec] = {
-    model: ModelSpec(model, "cerebras", "chat", model, 5, 30000)
+    model: ModelSpec(
+        model, "cerebras", "chat", model, 5, 30000,
+        supports_image_input=model == GEMMA_MODEL,
+    )
     for model in CEREBRAS_MODELS
 }
 MODEL_CATALOG.update({
@@ -41,7 +45,7 @@ MODEL_CATALOG.update({
     for model in GROQ_MODELS
 })
 MODEL_CATALOG.update({
-    AGNES_TEXT_MODEL: ModelSpec(AGNES_TEXT_MODEL, "agnes", "chat", "agnes-2.5-flash", 20),
+    AGNES_TEXT_MODEL: ModelSpec(AGNES_TEXT_MODEL, "agnes", "chat", "agnes-2.5-flash", 20, supports_image_input=True),
     AGNES_IMAGE_MODEL: ModelSpec(AGNES_IMAGE_MODEL, "agnes", "image", "agnes-image-2.1-flash", 20),
     AGNES_VIDEO_MODEL: ModelSpec(AGNES_VIDEO_MODEL, "agnes", "video", "agnes-video-v2.0", 1),
 })

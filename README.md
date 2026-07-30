@@ -1,4 +1,4 @@
-# Cerebras OpenAI API Gateway 2.1.0
+# Cerebras OpenAI API Gateway 2.1.1
 
 > 聚合 Cerebras、Groq 和 Agnes 的 OpenAI 兼容网关，支持多 Key 轮询、模型权限和贡献额度管理。
 
@@ -29,6 +29,7 @@
 - **分布式上游保护**：配置 Upstash 后，Cerebras、Groq 和 Agnes 的物理上游 RPM admission 在 Vercel 多实例间共享。
 - **管理面安全**：状态、日志、Debug、配置和控制页面仅允许 Admin 会话访问；控制修改使用 POST + CSRF，Admin 会话带 24 小时签名有效期。
 - **测试基线**：使用标准库 `unittest` 覆盖鉴权、模型目录、共享额度、管理页面、Provider adapter、视频 affinity 和 Redis 限额。
+- **图片输入预检**：请求进入上游前校验模型视觉能力和图片地址；客户端本地文件路径返回明确的 `400` 错误，不再表现为流式无回复。
 
 ---
 
@@ -226,6 +227,21 @@ export default {
   - `agnes/agnes-video-v2.0`
 
 Agnes 付费模型 `agnes-2.5-pro-alpha` 未纳入托管列表。
+
+### 图片输入说明
+
+图像理解支持：
+
+```text
+gemma-4-31b
+agnes/agnes-2.5-flash
+```
+
+云端网关无法读取客户端电脑上的本地路径，例如 `C:\Users\name\image.jpg`。请使用公网可访问的 HTTPS 图片 URL，或客户端上传后生成的 `data:image/...;base64,...` URI。
+
+不支持图片的模型会返回 `image_input_not_supported`；本地路径会返回 `local_image_unavailable`。这两个错误都会以标准 OpenAI JSON 返回，避免第三方客户端只显示“无回复”。
+
+Debug 页面的“一键复制 AI 调试包”会同时复制 `Request Body` 和 `Response Body`。
 
 ---
 

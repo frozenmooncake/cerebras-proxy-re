@@ -46,7 +46,7 @@ from provider_adapters import AgnesAdapter, GroqAdapter
 from access_control import ClientPrincipal, access_manager
 from distributed_limits import admit_fixed_window
 
-VERSION = "2.1.0-FastAPI"
+VERSION = "2.1.1-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 DEFAULT_MODEL = GPT_MODEL
@@ -668,6 +668,41 @@ def sanitize_messages(messages: list, show: bool) -> list:
         result.append(item)
     return result
 
+def validate_chat_images(model: str, messages: list) -> Optional[dict]:
+    spec = get_model_spec(model)
+    for message in messages or []:
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            is_image_file = block_type == "file" and str(block.get("media_type", block.get("mime_type", ""))).startswith("image/")
+            if block_type not in {"image", "image_url", "input_image"} and not is_image_file:
+                continue
+            image = block.get("image_url", block.get("image", block.get("source", "")))
+            if isinstance(image, dict):
+                url = image.get("url") or image.get("path") or image.get("file_path") or image.get("filename") or ""
+            else:
+                url = str(image or block.get("path") or block.get("file_path") or block.get("filename") or "")
+            normalized = url.strip().lower()
+            is_local = (
+                normalized.startswith("file:")
+                or (len(url) > 2 and url[1:3] in {":\\", ":/"})
+                or url.startswith("\\\\")
+            )
+            if is_local:
+                return {
+                    "message": "The gateway cannot access an image path on the client device. Upload the image through a public HTTPS URL or a data:image Base64 URI.",
+                    "code": "local_image_unavailable",
+                }
+            if spec is None or not spec.supports_image_input:
+                return {
+                    "message": f"Model {model} does not support image input. Use gemma-4-31b or agnes/agnes-2.5-flash for image understanding.",
+                    "code": "image_input_not_supported",
+                }
+    return None
+
 def sanitize_body(body: dict, show_thinking: bool, target_model: str = None) -> dict:
     model = target_model or body.get("model", DEFAULT_MODEL)
     new = {
@@ -777,6 +812,9 @@ async def chat(request: Request):
         return api_error(400, f"Unsupported model: {request_model}", "invalid_request_error", "unsupported_model", request_id)
     if request_spec.operation != "chat":
         return api_error(400, f"Use the {request_spec.operation} endpoint for this model", "invalid_request_error", "wrong_endpoint", request_id)
+    image_error = validate_chat_images(request_model, raw.get("messages", []))
+    if image_error:
+        return api_error(400, image_error["message"], "invalid_request_error", image_error["code"], request_id)
     principal, auth_error = await authorize_model_request(request, request_model, request_id, raw)
     if auth_error:
         return auth_error
@@ -1535,8 +1573,11 @@ async def debug(request: Request):
     copy_script = """
     <script>
     function copyDebugInfo(idx) {
+        const reqEl = document.getElementById('req-body-' + idx);
         const respEl = document.getElementById('resp-body-' + idx);
-        const text = respEl ? respEl.innerText : '';
+        const requestText = reqEl ? reqEl.innerText : '';
+        const responseText = respEl ? respEl.innerText : '';
+        const text = '【Request Body】\n' + requestText + '\n\n【Response Body】\n' + responseText;
         navigator.clipboard.writeText(text).then(() => { alert('复制成功！'); }).catch(err => { alert('复制失败: ' + err); });
     }
     </script>
@@ -1570,7 +1611,7 @@ async def debug(request: Request):
                 </div>
                 <div style="margin-top:10px;">
                     <strong style="color:#60a5fa;">【Request Body】:</strong>
-                    <pre style="background:#1f2937; padding:10px; border-radius:4px; overflow-x:auto; max-height:300px; color:#f3f4f6; font-size:12px;">{req_body}</pre>
+                    <pre id="req-body-{idx}" style="background:#1f2937; padding:10px; border-radius:4px; overflow-x:auto; max-height:300px; color:#f3f4f6; font-size:12px;">{req_body}</pre>
                 </div>
                 <div style="margin-top:10px;">
                     <strong style="color:#34d399;">【Response Body】:</strong>
