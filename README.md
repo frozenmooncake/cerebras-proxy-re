@@ -128,7 +128,7 @@ Agnes 免费/default 官方实际 RPM：文本 20；图片 1K/2K/3K/4K 分别为
 
 ```bash
 # 克隆仓库
-git clone https://github.com/xyrct301/cerebras-proxy-re.git
+git clone https://github.com/frozenmooncake/cerebras-proxy-re.git
 cd cerebras-proxy-re
 
 # 安装依赖
