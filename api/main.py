@@ -1419,7 +1419,7 @@ async def menu():
     await refresh_runtime_config_async()
     body = f"""<h2>🧠 Cerebras OpenAI Gateway Menu</h2>
 <p><strong>Version:</strong> {VERSION}</p>
-<p style="color: #9ca3af; font-size: 14px; margin-top: -10px;">作者：速冻月饼 | 🔗 <a href="https://github.com/xyrct301/cerebras-proxy-re" target="_blank">GitHub 开源仓库</a></p>
+<p style="color: #9ca3af; font-size: 14px; margin-top: -10px;">作者：速冻月饼 | 🔗 <a href="https://github.com/frozenmooncake/cerebras-proxy-re" target="_blank">GitHub 开源仓库</a></p>
 <hr style="border-color:#1e293b;"/>
 <h3>📌 API Endpoint</h3>
 <p>🔗 <a href="/v1/models" target="_blank">/v1/models (查看可用模型列表)</a></p>
@@ -1755,7 +1755,7 @@ async def config(request: Request):
     body = f"""<h2>⚙️ 系统当前全局运行配置</h2>
 <pre style='background:#1f2937; color:#f3f4f6; padding:15px; border-radius:6px; border:1px solid #374151;'>
 网关核心版本: {VERSION}
-开源 GitHub: https://github.com/xyrct301/cerebras-proxy-re
+开源 GitHub: https://github.com/frozenmooncake/cerebras-proxy-re
 全局默认模型: {DEFAULT_MODEL}
 Cerebras Key 总计: {len(CEREBRAS_API_KEYS)} 个
 Groq Key 总计: {len(groq_pool.keys)} 个
