@@ -46,7 +46,7 @@ from provider_adapters import AgnesAdapter, GroqAdapter
 from access_control import ClientPrincipal, access_manager
 from distributed_limits import admit_fixed_window
 
-VERSION = "2.1.2-FastAPI"
+VERSION = "2.1.3-FastAPI"
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
 
 DEFAULT_MODEL = GPT_MODEL
@@ -541,7 +541,7 @@ def sse(data: Any) -> str:
         data = json.dumps(data, ensure_ascii=False)
     return f"data: {data}\n\n"
 
-def html_page(title: str, body: str) -> str:
+def html_page(title: str, body: str, show_bottom_nav: bool = True) -> str:
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -559,6 +559,9 @@ pre {{ overflow-x: auto; line-height: 1.6; }}
 .nav {{ max-width: 1200px; margin: 20px auto; font-weight: bold; text-align: center; }}
 .nav-btn {{ display: inline-block; padding: 10px 20px; background: #1f2937; color: #fff; border: 1px solid #374151; border-radius: 6px; }}
 .nav-btn:hover {{ background: #374151; }}
+.page-heading {{ display:flex; align-items:center; flex-wrap:wrap; gap:12px; border-bottom:1px solid #1e293b; padding-bottom:8px; margin-bottom:16px; }}
+.page-heading h2 {{ margin:0; padding:0; border:0; }}
+.page-heading .nav-btn {{ flex:none; padding:6px 12px; font-size:13px; }}
 .grid-2 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 20px; }}
 .card {{ background: #1f2937; border: 1px solid #374151; border-radius: 8px; padding: 16px; }}
 .metric-row {{ display: flex; justify-content: space-between; margin-bottom: 8px; font-size: 14px; }}
@@ -577,12 +580,14 @@ h3 {{ font-size: 16px; line-height: 1.3; }}
 .card {{ padding: 12px; }}
 .metric-row {{ align-items: flex-start; gap: 8px; }}
 .nav-btn {{ width: 100%; box-sizing: border-box; }}
+.page-heading {{ align-items:flex-start; }}
+.page-heading .nav-btn {{ width:auto; }}
 }}
 </style>
 </head>
 <body>
 <div class="box">{body}</div>
-<div class="nav"><a href="/menu" class="nav-btn">🔙 返回主菜单</a></div>
+{'<div class="nav"><a href="/menu" class="nav-btn">🔙 返回主菜单</a></div>' if show_bottom_nav else ''}
 </body>
 </html>"""
 
@@ -1428,7 +1433,7 @@ async def menu():
 <p> <code>POST /v1/videos</code> (Agnes 视频任务)</p>
 <h3>📊 监控中心 (Monitor)</h3>
 <p>📈 <a href="/status">/status (实时上游限额 & 物理Key高级看板)</a></p>
-<p>📜 <a href="/log">/log (最近 100 条请求历史)</a></p>
+<p>📜 <a href="/logs">/logs (最近 100 条请求历史)</a></p>
 <p>🔍 <a href="/debug">/debug (最近 50 条全量请求体/响应体深度调试)</a></p>
 <p>⚙️ <a href="/config">/config (系统核心配置)</a></p>
 <p>🔐 <a href="/admin">/admin (客户端 Key 与贡献额度管理)</a></p>
@@ -1629,7 +1634,7 @@ async def status(request: Request):
 
     return HTMLResponse(content=html_page("Status 看板", html))
 
-@app.get("/log", response_class=HTMLResponse)
+@app.get("/logs", response_class=HTMLResponse)
 async def log_page(request: Request):
     if not is_admin_authenticated(request):
         return admin_required_response()
@@ -1645,10 +1650,13 @@ async def log_page(request: Request):
             )
     log_content = "\n".join(lines)
     html_body = f"""
-    <h2>📜 历史回溯请求日志</h2>
+    <div class="page-heading">
+        <h2>📜 历史回溯请求日志</h2>
+        <a href="/menu" class="nav-btn">🔙 返回主菜单</a>
+    </div>
     <div style="background:#1f2937; color:#f3f4f6; padding:15px; border-radius:6px; border:1px solid #374151; white-space: pre-wrap; word-break: break-all; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; line-height: 1.6;">{log_content}</div>
     """
-    return HTMLResponse(content=html_page("Request Logs", html_body))
+    return HTMLResponse(content=html_page("Request Logs", html_body, show_bottom_nav=False))
 
 @app.get("/debug", response_class=HTMLResponse)
 async def debug(request: Request):
@@ -1741,11 +1749,13 @@ async def debug(request: Request):
     content = "".join(items_html) if items_html else "<p style='color:#9ca3af;'>暂无 Debug 日志记录</p>"
     body_html = f"""
     {copy_script}
-    <h2>🔍 全量 Debug 深度调试面板 <span class="tag">(最近 50 条)</span></h2>
-    <hr style="border-color:#1e293b; margin-bottom:15px;"/>
+    <div class="page-heading">
+        <h2>🔍 全量 Debug 深度调试面板 <span class="tag">(最近 50 条)</span></h2>
+        <a href="/menu" class="nav-btn">🔙 返回主菜单</a>
+    </div>
     {content}
     """
-    return HTMLResponse(content=html_page("Debug 深度调试", body_html))
+    return HTMLResponse(content=html_page("Debug 深度调试", body_html, show_bottom_nav=False))
 
 @app.get("/config", response_class=HTMLResponse)
 async def config(request: Request):

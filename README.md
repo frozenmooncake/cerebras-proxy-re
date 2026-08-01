@@ -1,4 +1,4 @@
-# Cerebras OpenAI API Gateway 2.1.2
+# Cerebras OpenAI API Gateway 2.1.3
 
 > 聚合 Cerebras、Groq 和 Agnes 的 OpenAI 兼容网关，支持多 Key 轮询、模型权限和贡献额度管理。
 
@@ -43,7 +43,7 @@
 | `/status` | 实时全局负载水位、上游限额看板与物理 Key 冷却状态 |
 | `/thinkingdisplay` | 强行控制/抹除 AI 思考推理过程 (`AUTO` / `ON` / `OFF`) |
 | `/fallbackmode` | GLM -> GPT 自动降级策略切换 (`AUTO` / `OFF` / `FORCE_GPT`) |
-| `/log` | 最近 100 条请求日志回溯 |
+| `/logs` | 最近 100 条请求日志回溯 |
 | `/debug` | 最近 50 条全量 Request/Response 抓包与一键打包复制 AI 调试信息 |
 | `/admin` | 创建、启用、禁用和删除客户端 Key，配置权限范围、模型白名单和贡献数量 |
 
@@ -110,7 +110,7 @@
 
 `providers` 中的数量同时表示服务商访问权限和贡献数量。`0` 表示禁止访问该服务商。服务端实际额度始终读取配置内容，不信任 Key 名称中的数字。Admin 页面生成的动态 Key 需要 Upstash 持久化；未配置 Upstash 时 Admin 为只读模式。
 
-Vercel Serverless 的内存和临时文件不会跨实例长期保留。若需要 `/log`、`/debug`、`/thinkingdisplay`、`/fallbackmode` 在刷新、冷启动和重新部署后保持状态，必须同时配置 `UPSTASH_REDIS_REST_URL` 与 `UPSTASH_REDIS_REST_TOKEN`。
+Vercel Serverless 的内存和临时文件不会跨实例长期保留。若需要 `/logs`、`/debug`、`/thinkingdisplay`、`/fallbackmode` 在刷新、冷启动和重新部署后保持状态，必须同时配置 `UPSTASH_REDIS_REST_URL` 与 `UPSTASH_REDIS_REST_TOKEN`。
 
 例如贡献者 A 提供了 2 个 Cerebras Key 和 1 个 Groq Key，则配置为 `cerebras: 2`、`groq: 1`、`agnes: 0`。该客户端 Key 可以调用 Cerebras 和 Groq，但 `/v1/models` 不会返回 Agnes 模型，直接请求 Agnes 也会返回 `403 model_not_allowed`。
 
@@ -267,7 +267,7 @@ python -m py_compile api/main.py api/model_catalog.py api/provider_adapters.py a
 
 ```text
 /status
-/log
+/logs
 /debug
 /config
 /thinkingdisplay
