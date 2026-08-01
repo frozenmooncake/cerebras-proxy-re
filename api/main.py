@@ -541,7 +541,8 @@ def sse(data: Any) -> str:
         data = json.dumps(data, ensure_ascii=False)
     return f"data: {data}\n\n"
 
-def html_page(title: str, body: str) -> str:
+def html_page(title: str, body: str, nav_at_top: bool = False) -> str:
+    nav = '<div class="nav"><a href="/menu" class="nav-btn">🔙 返回主菜单</a></div>'
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -581,8 +582,9 @@ h3 {{ font-size: 16px; line-height: 1.3; }}
 </style>
 </head>
 <body>
+{nav if nav_at_top else ''}
 <div class="box">{body}</div>
-<div class="nav"><a href="/menu" class="nav-btn">🔙 返回主菜单</a></div>
+{'' if nav_at_top else nav}
 </body>
 </html>"""
 
@@ -1428,7 +1430,7 @@ async def menu():
 <p> <code>POST /v1/videos</code> (Agnes 视频任务)</p>
 <h3>📊 监控中心 (Monitor)</h3>
 <p>📈 <a href="/status">/status (实时上游限额 & 物理Key高级看板)</a></p>
-<p>📜 <a href="/log">/log (最近 100 条请求历史)</a></p>
+<p>📜 <a href="/logs">/logs (最近 100 条请求历史)</a></p>
 <p>🔍 <a href="/debug">/debug (最近 50 条全量请求体/响应体深度调试)</a></p>
 <p>⚙️ <a href="/config">/config (系统核心配置)</a></p>
 <p>🔐 <a href="/admin">/admin (客户端 Key 与贡献额度管理)</a></p>
@@ -1629,7 +1631,7 @@ async def status(request: Request):
 
     return HTMLResponse(content=html_page("Status 看板", html))
 
-@app.get("/log", response_class=HTMLResponse)
+@app.get("/logs", response_class=HTMLResponse)
 async def log_page(request: Request):
     if not is_admin_authenticated(request):
         return admin_required_response()
@@ -1648,7 +1650,7 @@ async def log_page(request: Request):
     <h2>📜 历史回溯请求日志</h2>
     <div style="background:#1f2937; color:#f3f4f6; padding:15px; border-radius:6px; border:1px solid #374151; white-space: pre-wrap; word-break: break-all; overflow-x: auto; font-family: 'Consolas', 'Monaco', monospace; font-size: 13px; line-height: 1.6;">{log_content}</div>
     """
-    return HTMLResponse(content=html_page("Request Logs", html_body))
+    return HTMLResponse(content=html_page("Request Logs", html_body, nav_at_top=True))
 
 @app.get("/debug", response_class=HTMLResponse)
 async def debug(request: Request):
