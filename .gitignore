@@ -4,5 +4,4 @@ gateway_stats.json
 gateway_pool.json
 api/gateway_stats.json
 api/gateway_pool.json
-tests/*
-!tests/test_token_usage.py
+tests/
