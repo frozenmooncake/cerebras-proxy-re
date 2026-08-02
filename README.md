@@ -143,9 +143,9 @@ uvicorn api.main:app --reload --port 8000
 
 启动后访问 http://127.0.0.1:8000/menu 即可使用。
 
-### 2. 部署至 Vercel (Serverless - 推荐)
+### 2. 部署至 [Vercel](https://vercel.com) (Serverless - 推荐)
 
-1. **导入项目**：在 Vercel 控制台点击 `New Project`，导入本仓库。
+1. **导入项目**：在 [Vercel](https://vercel.com) 控制台点击 `New Project`，导入本仓库。
 2. **框架预设 (Framework Preset)**：选择 `Other`（纯 Python Serverless 项目无需选择前端预设）。
 3. **各项设置**：
    - 根目录：保持默认 `./`。
@@ -154,19 +154,19 @@ uvicorn api.main:app --reload --port 8000
 4. **配置环境变量**：点击展开 `Environment Variables`，将 `CEREBRAS_API_KEYS` 等所有密钥逐个添加。
 5. **一键部署**：确认无误后，点击底部的 `Deploy` 按钮，等待自动打包上线即可。
 
-### 3. 部署至 Render (配合精准保活)
+### 3. 部署至 [Render](https://render.com) (配合精准保活)
 
-1. 登录 Render.com 选择 `New Web Service`，绑定本仓库。
+1. 登录 [Render.com](https://render.com) 选择 `New Web Service`，绑定本仓库。
 2. **Environment**: `Python 3`
 3. **Build Command**: `pip install -r requirements.txt`
 4. **Start Command**: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
 5. 在 `Environment Variables` 填入密钥后发布。
-6. **保活策略**：避免 Render 免费额度超标，推荐使用 cron-job.org 设置定时任务：
+6. **保活策略**：避免 Render 免费额度超标，推荐使用 [cron-job.org](https://cron-job.org) 设置定时任务：
    - Cron 表达式：`*/10 0-1,8-23 * * *`（每 10 分钟请求一次 `/health`，并在夜间 02:00 - 07:59 自动休眠以节省额度）。
 
-### 4. 部署至 Koyeb
+### 4. 部署至 [Koyeb](https://www.koyeb.com)
 
-1. 登录 Koyeb.com 并关联你的 GitHub 仓库。
+1. 登录 [Koyeb.com](https://www.koyeb.com) 并关联你的 GitHub 仓库。
 2. 创建服务，构建类型选择 `Buildpack`。
 3. **Build Command**: `pip install -r requirements.txt`
 4. **Start Command**: `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
@@ -174,9 +174,9 @@ uvicorn api.main:app --reload --port 8000
 
 ---
 
-## 🛡️ 高可用双活主备方案 (Cloudflare Worker)
+## 🛡️ 高可用双活主备方案 ([Cloudflare Worker](https://www.cloudflare.com))
 
-为了防止单个 Serverless 平台超额限流或冷启动超时，可通过 Cloudflare Worker（免费版）实现 Vercel（主）+ Render（备）秒级自动故障转移：
+为了防止单个 Serverless 平台超额限流或冷启动超时，可通过 [Cloudflare Worker](https://www.cloudflare.com)（免费版）实现 [Vercel](https://vercel.com)（主）+ [Render](https://render.com)（备）秒级自动故障转移：
 
 ```javascript
 export default {
